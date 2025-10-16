@@ -1,5 +1,6 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.2 — Remove preset qty; allow scan OR type for Location, Pallet, LOT
+# v1.4 — Remove 8304 trim rule; use st.rerun(); scan OR type for Pallet/Location/LOT; warning icon for location
+
 import os
 import io
 import re
@@ -8,7 +9,7 @@ import csv
 import sys
 import time
 import platform
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, List
 from urllib.parse import urlparse, parse_qs, unquote_plus
 from datetime import datetime
 from pathlib import Path
@@ -42,7 +43,6 @@ def _parse_notify_to(s: str) -> List[str]:
 NOTIFY_TO = _parse_notify_to(NOTIFY_TO_ENV)
 
 KIOSK = os.getenv("PICKING_HELPER_KIOSK", "0").strip() == "1"
-START_MARKER = "8304"
 LOOKUP_FILE_ENV = os.getenv("PICKING_HELPER_LOOKUP_FILE", "").strip()
 
 # --------------- SESSION STATE ---------------
@@ -59,14 +59,14 @@ defaults = {
     "staging_location_current": "",
     # scans/typing buffers
     "scan": "",                        # pallet scan
-    "source_scan": "",                 # NEW: source location scan
-    "typed_source": "",                # NEW: source location type field
-    "typed_pallet_id": "",             # NEW: type pallet id
-    "lot_scan": "",                    # NEW: lot scan
-    "typed_lot": "",                   # NEW: type lot
+    "source_scan": "",                 # source location scan
+    "typed_source": "",                # source location typed
+    "typed_pallet_id": "",             # typed pallet
+    "lot_scan": "",                    # lot scan
+    "typed_lot": "",                   # typed lot
     "staging_scan": "",                # staging scan
     # qty
-    "qty_staged": 0,                   # no presets, numeric only
+    "qty_staged": 0,                   # numeric only (no presets)
     # misc
     "starting_qty": None,              # optional for Remaining calc
     "picked_so_far": {},               # pallet_id -> picked qty sum
@@ -85,14 +85,6 @@ for k, v in defaults.items():
 # --------------- HELPERS ----------------
 def clean_scan(raw: str) -> str:
     return (raw or "").replace("\r", "").replace("\n", "").strip()
-
-def apply_start_marker(s: str, marker: str) -> Tuple[str, bool]:
-    if not marker:
-        return s, False
-    idx = s.find(marker)
-    if idx >= 0:
-        return s[idx:], True
-    return s, False
 
 def append_log_row(row: dict):
     file_exists = os.path.isfile(LOG_FILE)
@@ -149,6 +141,9 @@ def normalize_lot(lot: Optional[str]) -> str:
         return ""
     digits = re.sub(r"\D", "", lot)
     return digits.lstrip("0") or "0"
+
+def _is_valid_source_location(loc: str) -> bool:
+    return bool(loc) and loc.isdigit() and len(loc) == 8
 
 # --------------- LOOKUP SUPPORT ---------------
 def _auto_guess_cols(columns: List[str]) -> Dict[str, Optional[str]]:
@@ -226,7 +221,7 @@ def lookup_fields_by_pallet(df, colmap: Dict[str, Optional[str]], pallet_id: str
 
 # --------------- SIDEBAR ----------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.2 (no-presets; scan-or-type fields)", icon="🧭")
+    st.info("BUILD: outbound-batch v1.4 (no 8304; st.rerun)", icon="🧭")
     st.markdown("### ⚙️ Settings")
 
     ss["operator"] = st.text_input("Operator (optional)", value=ss.operator, placeholder="e.g., Carlos")
@@ -369,15 +364,15 @@ def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
 
 # --------------- SCAN/TYPING HANDLERS ---------------
 def on_pallet_scan():
+    # NOTE: the 8304 trimming rule has been removed; use scan as-is.
     raw = ss.scan or ""
     code = clean_scan(raw)
     if not code:
         return
-    trimmed, was_trimmed = apply_start_marker(code, START_MARKER)
-    after = trimmed[len(START_MARKER):] if trimmed.startswith(START_MARKER) else trimmed
-    parsed = (try_parse_json(after) or try_parse_query_or_kv(after) or try_parse_gs1_paren(after) or {})
+    # Try rich parsing; if none, fall back to the scanned code as the pallet ID
+    parsed = (try_parse_json(code) or try_parse_query_or_kv(code) or try_parse_gs1_paren(code) or {})
     norm = normalize_keys(parsed) if parsed else {}
-    pallet_id = norm.get("pallet") or after.strip()
+    pallet_id = norm.get("pallet") or code
     ss.current_pallet = pallet_id
 
     loc = norm.get("location")
@@ -400,15 +395,13 @@ def on_pallet_scan():
     if sku is not None: ss.sku = sku or ""
     if lot is not None: ss.lot_number = lot or ""
 
-    bits = []
-    if was_trimmed: bits.append(f"Trimmed at '{START_MARKER}'")
-    bits.append(f"Pallet {ss.current_pallet}")
+    bits = [f"Pallet {ss.current_pallet}"]
     if ss.current_location: bits.append(f"Location {ss.current_location}")
     if ss.sku: bits.append(f"SKU {ss.sku}")
     if ss.lot_number: bits.append(f"LOT {ss.lot_number}")
     st.toast(" \n".join(bits), icon="✅")
 
-    ss.recent_scans.insert(0, (datetime.now().strftime("%H:%M:%S"), trimmed))
+    ss.recent_scans.insert(0, (datetime.now().strftime("%H:%M:%S"), code))
     ss.recent_scans = ss.recent_scans[:25]
     ss.scan = ""
 
@@ -474,7 +467,7 @@ st.subheader("Pallet ID")
 cP1, cP2 = st.columns([2, 1])
 with cP1:
     st.text_input("Scan pallet here", key="scan",
-                  placeholder="Scan pallet barcode (app trims at 8304; uses lookup if needed)",
+                  placeholder="Scan pallet barcode (raw scan is used; JSON/query/GS1 parsed if present)",
                   on_change=on_pallet_scan)
 with cP2:
     st.text_input("…or type Pallet ID", key="typed_pallet_id", placeholder="e.g., JTL00496")
@@ -490,6 +483,13 @@ with cL1:
 with cL2:
     st.text_input("…or type location", key="typed_source", placeholder="e.g., 11400804")
     st.button("Set Location", on_click=set_typed_source, use_container_width=True)
+
+# Inline warning icon if current_location isn't 8 digits numeric (visual cue only)
+if ss.current_location:
+    if not _is_valid_source_location(ss.current_location):
+        st.warning("Expected 8 digits (e.g., 11400804). You can proceed, but please double‑check.", icon="⚠️")
+    else:
+        st.caption("✅ Source Location format looks good.")
 
 # C) LOT — scan or type
 st.subheader("LOT Number")
@@ -542,7 +542,7 @@ qty_staged = st.number_input(
 )
 ss.qty_staged = qty_staged
 
-# Optional running tracker (unchanged)
+# Optional running tracker
 st.subheader("Pick (optional tracker)")
 pick_qty = st.number_input("Qty picked", min_value=0, step=1, value=0)
 
@@ -757,9 +757,12 @@ else:
                     else:
                         st.success("Submitted! Admin will receive the email/Teams notification.")
                         ss.batch_rows = []
-                        st.toast(f"Batch {batch_id} submitted — {payload['totals']['lines']} lines / {payload['totals']['qty_staged_sum']} cases.", icon="📨")
+                        st.toast(
+                            f"Batch {batch_id} submitted — {payload['totals']['lines']} lines / {payload['totals']['qty_staged_sum']} cases.",
+                            icon="📨"
+                        )
                         time.sleep(0.5)
-                        st.experimental_rerun()
+                        st.rerun()  # updated API (replaces deprecated st.experimental_rerun)
 
 # -------- Log table preview (today) --------
 st.markdown("---")
