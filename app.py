@@ -4,6 +4,8 @@ import io
 import re
 import json
 import csv
+import sys
+import platform
 from typing import Optional, Dict, Tuple, List
 from urllib.parse import urlparse, parse_qs, unquote_plus
 from datetime import datetime
@@ -90,7 +92,7 @@ def make_partial_tag_png(location: str, pallet: str, qty_remaining: Optional[int
         font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 48)
         font_body  = ImageFont.truetype("DejaVuSans.ttf", 34)
         font_small = ImageFont.truetype("DejaVuSans.ttf", 24)
-    except:
+    except Exception:
         font_title = ImageFont.load_default()
         font_body  = ImageFont.load_default()
         font_small = ImageFont.load_default()
@@ -155,25 +157,34 @@ def load_lookup(path: Optional[str], uploaded_bytes: Optional[bytes]):
     Returns (df, guessed_cols) or (None, None).
     Supports CSV or Excel. For Excel, uses engine openpyxl.
     """
-    import pandas as pd
+    try:
+        import pandas as pd  # Import INSIDE so missing pandas gives a clear error only when needed
+    except Exception as e:
+        raise RuntimeError(f"pandas not available: {e}")
+
     df = None
-    if uploaded_bytes:
-        try:
-            # Try Excel first
+    try:
+        if uploaded_bytes:
             try:
-                df = pd.read_excel(io.BytesIO(uploaded_bytes), engine="openpyxl")
-            except Exception:
-                df = pd.read_csv(io.BytesIO(uploaded_bytes))
-        except Exception:
-            df = None
-    elif path and os.path.exists(path):
-        try:
-            if path.lower().endswith((".xlsx",".xlsm",".xls")):
-                df = pd.read_excel(path, engine="openpyxl")
-            else:
-                df = pd.read_csv(path)
-        except Exception:
-            df = None
+                # Try Excel first
+                try:
+                    df = pd.read_excel(io.BytesIO(uploaded_bytes), engine="openpyxl")
+                except Exception:
+                    df = pd.read_csv(io.BytesIO(uploaded_bytes))
+            except Exception as e:
+                raise RuntimeError(f"Failed to read uploaded file: {e}")
+        elif path and os.path.exists(path):
+            try:
+                if path.lower().endswith((".xlsx",".xlsm",".xls")):
+                    df = pd.read_excel(path, engine="openpyxl")
+                else:
+                    df = pd.read_csv(path)
+            except Exception as e:
+                raise RuntimeError(f"Failed to read file at {path}: {e}")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Lookup load error: {e}")
 
     if df is not None and len(df) > 0:
         df.columns = [str(c).strip() for c in df.columns]
@@ -209,23 +220,37 @@ def lookup_fields_by_pallet(df, colmap: Dict[str, Optional[str]], pallet_id: str
 
 # ---------- SIDEBAR ----------
 with st.sidebar:
+    # Build badge so we know the new code is live
+    st.info("BUILD: 8304-lookup v1.1 DIAG", icon="🧪")
+
     st.markdown("### ⚙️ Settings")
     ss["operator"] = st.text_input("Operator (optional)", value=ss.operator, placeholder="e.g., Carlos")
     st.write("**Log file:**", f"`{LOG_FILE}`")
     st.markdown("---")
 
+    # ---- Inventory Lookup panel is ALWAYS visible (header + uploader) ----
     st.markdown("#### Inventory Lookup (optional)")
     st.caption("Upload CSV/XLSX to auto-fill SKU / LOT / Location from Pallet ID.")
     uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv","xlsx","xls"], accept_multiple_files=False)
     up_bytes = uploaded.read() if uploaded is not None else None
 
-    # Load: uploaded file first, else env path (PICKING_HELPER_LOOKUP_FILE)
-    df, guessed = load_lookup(LOOKUP_FILE_ENV if not up_bytes else None, up_bytes)
-    ss.lookup_df = df
+    df, guessed = None, None
+    lookup_error = None
+    # Attempt to load lookup (uploaded takes precedence; else env path)
+    try:
+        df, guessed = load_lookup(LOOKUP_FILE_ENV if not up_bytes else None, up_bytes)
+        ss.lookup_df = df
+    except Exception as e:
+        lookup_error = str(e)
+        ss.lookup_df = None
 
-    if df is not None:
-        st.success(f"Loaded lookup with {len(df):,} rows")
-        cols = list(df.columns)
+    if lookup_error:
+        st.error(f"Lookup load error: {lookup_error}")
+        st.caption("Add requirements.txt with: streamlit, pandas, openpyxl, Pillow. Then redeploy.")
+
+    if ss.lookup_df is not None:
+        st.success(f"Loaded lookup with {len(ss.lookup_df):,} rows")
+        cols = list(ss.lookup_df.columns)
         g = guessed or {"pallet": None, "sku": None, "lot": None, "location": None}
 
         c1, c2 = st.columns(2)
@@ -236,16 +261,18 @@ with st.sidebar:
             ss.lookup_cols["lot"]      = st.selectbox("LOT column",      options=["(none)"] + cols, index=(cols.index(g["lot"]) + 1) if g["lot"] in cols else 0)
             ss.lookup_cols["location"] = st.selectbox("Location column", options=["(none)"] + cols, index=(cols.index(g["location"]) + 1) if g["location"] in cols else 0)
 
-        # Normalize "(none)" back to None
         for k in ["sku","lot","location"]:
             if ss.lookup_cols.get(k) == "(none)":
                 ss.lookup_cols[k] = None
 
         with st.expander("Preview lookup (first 10 rows)", expanded=False):
-            import pandas as pd
-            st.dataframe(df.head(10), use_container_width=True)
+            try:
+                import pandas as pd  # for display types; if missing, already caught above
+                st.dataframe(ss.lookup_df.head(10), use_container_width=True)
+            except Exception:
+                st.write(ss.lookup_df.head(10))
     else:
-        if LOOKUP_FILE_ENV:
+        if LOOKUP_FILE_ENV and not lookup_error:
             st.warning(f"Could not load lookup from `{LOOKUP_FILE_ENV}`. Upload a file or check the path.")
 
     st.markdown("---")
@@ -256,6 +283,25 @@ with st.sidebar:
         help="Set this if you want the app to compute remaining qty."
     )
     st.caption("Tip: Set this after you scan a pallet to track remaining.")
+
+    # ---- Diagnostics (to confirm we are on the right build & have deps) ----
+    with st.expander("Diagnostics", expanded=False):
+        st.write({
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            "streamlit": st.__version__,
+            "LOOKUP_FILE_ENV": LOOKUP_FILE_ENV or "(empty)",
+            "cwd": os.getcwd(),
+            "files_in_cwd": sorted(os.listdir("."))[:50],
+        })
+        # Show package versions if available
+        def _ver(modname):
+            try:
+                m = __import__(modname)
+                return getattr(m, "__version__", "installed (no __version__)")
+            except Exception as e:
+                return f"NOT installed: {e}"
+        st.write({"pandas": _ver("pandas"), "openpyxl": _ver("openpyxl"), "PIL(Pillow)": _ver("PIL")})
 
 # ---------- HEADER ----------
 st.title("📦 Picking Helper")
@@ -350,12 +396,11 @@ def on_scan():
     pallet_id = norm.get("pallet") or after.strip()
     ss.current_pallet = pallet_id
 
-    # Use parsed values if present
+    # Use parsed values if present; else lookup
     loc = norm.get("location")
     sku = norm.get("sku")
     lot = norm.get("lot")
 
-    # 4) Lookup fallback for missing fields
     if ss.lookup_df is not None and (not loc or not sku or not lot):
         lookup_map = {
             "pallet": ss.lookup_cols.get("pallet"),
@@ -510,8 +555,12 @@ if ss.tag_bytes:
 st.markdown("---")
 st.subheader("Today’s Log (preview)")
 if os.path.exists(LOG_FILE):
-    import pandas as pd
-    dfprev = pd.read_csv(LOG_FILE)
-    st.dataframe(dfprev.tail(50), use_container_width=True, height=320)
+    try:
+        import pandas as pd
+        dfprev = pd.read_csv(LOG_FILE)
+        st.dataframe(dfprev.tail(50), use_container_width=True, height=320)
+    except Exception:
+        # Even if pandas missing, still show file exists
+        st.code(open(LOG_FILE, "r", encoding="utf-8", errors="ignore").read().splitlines()[-10:])
 else:
     st.info("No log entries yet today.")
