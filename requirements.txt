@@ -1,10 +1,6 @@
-﻿streamlit
-pandas
-pymupdf
-streamlit
-pandas
-numpy
-openpyxl
-pillow
-streamlit-aggrid
-lottie
+﻿streamlit>=1.37
+pandas>=2.0
+openpyxl>=3.1
+xlrd>=2.0
+pillow>=10.2
+requests>=2.31
