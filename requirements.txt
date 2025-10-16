@@ -1,3 +1,11 @@
 ﻿streamlit
 pandas
 pymupdf
+streamlit
+pandas
+numpy
+openpyxl
+pillow
+streamlit-aggrid
+lottie
+.gitignore
