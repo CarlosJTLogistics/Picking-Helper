@@ -8,4 +8,3 @@ openpyxl
 pillow
 streamlit-aggrid
 lottie
-.gitignore
