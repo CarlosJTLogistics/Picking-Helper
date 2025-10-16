@@ -21,11 +21,8 @@ LOG_DIR = os.getenv("PICKING_HELPER_LOG_DIR", "logs")
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"picking-log-{TODAY}.csv")
 
-# Locked start-marker per Carlos: always trim at first '8304'
-START_MARKER = "8304"  # can optionally honor env override if ever needed
-
-# Optional registry file path (CSV/XLSX) for lookups (pallet -> sku/lot/location)
-LOOKUP_FILE_ENV = os.getenv("PICKING_HELPER_LOOKUP_FILE", "").strip()
+# Always trim at first '8304'
+START_MARKER = "8304"
 
 # ---------- SESSION STATE ----------
 ss = st.session_state
@@ -42,9 +39,6 @@ defaults = {
     "scan": "",
     "qty_staged": 0,
     "chosen_quick": None,
-    # lookup UI state
-    "lookup_df": None,
-    "lookup_cols": {"pallet": None, "sku": None, "lot": None, "location": None},
 }
 for k, v in defaults.items():
     if k not in ss:
@@ -59,7 +53,6 @@ def clean_scan(raw: str) -> str:
     return (raw or "").replace("\r", "").replace("\n", "").strip()
 
 def apply_start_marker(s: str, marker: str) -> Tuple[str, bool]:
-    """Trim string to start at first occurrence of marker (inclusive)."""
     if not marker:
         return s, False
     idx = s.find(marker)
@@ -127,82 +120,59 @@ def normalize_lot(lot: Optional[str]) -> str:
     digits = digits.lstrip("0") or "0"
     return digits
 
-# ---------- LOOKUP SUPPORT ----------
-def _auto_guess_cols(columns: List[str]) -> Dict[str, Optional[str]]:
-    """Guess mapping for pallet/sku/lot/location from available headers."""
-    cols_lower = {c.lower(): c for c in columns}
-    def pick(syns: List[str]) -> Optional[str]:
-        for s in syns:
-            if s in cols_lower: return cols_lower[s]
-        # partial contains
-        for c in columns:
-            cl = c.lower()
-            if any(s in cl for s in syns):
-                return c
+# ---- Parsers ----
+def try_parse_json(s: str) -> Optional[Dict[str,str]]:
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
         return None
 
-    pallet_col   = pick(["pallet","pallet id","pallet_id","lpn","license","serial","sscc"])
-    sku_col      = pick(["sku","item","itemcode","product","part","material"])
-    lot_col      = pick(["lot","lot_number","batch","batchno"])
-    location_col = pick(["location","loc","bin","slot","staging","stg"])
-    return {"pallet": pallet_col, "sku": sku_col, "lot": lot_col, "location": location_col}
+def try_parse_query_or_kv(s: str) -> Optional[Dict[str,str]]:
+    if "://" in s:
+        parsed = urlparse(s)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        return {k.lower(): unquote_plus(v[-1]) if v else "" for k, v in qs.items()} or None
+    sep_standardized = s.replace(";", "&").replace("|", "&")
+    if "=" in sep_standardized:
+        parts = [p for p in sep_standardized.split("&") if p]
+        kv = {}
+        for p in parts:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                kv[k.strip().lower()] = unquote_plus(v.strip())
+        return kv or None
+    return None
 
-@st.cache_data(show_spinner=False)
-def load_lookup(path: Optional[str], uploaded_bytes: Optional[bytes]):
-    """
-    Returns (df, columns) or (None, None).
-    Supports CSV or Excel. For Excel, uses engine openpyxl.
-    """
-    import pandas as pd
-    df = None
-    if uploaded_bytes:
-        try:
-            # Try Excel first
-            try:
-                df = pd.read_excel(io.BytesIO(uploaded_bytes), engine="openpyxl")
-            except Exception:
-                df = pd.read_csv(io.BytesIO(uploaded_bytes))
-        except Exception:
-            df = None
-    elif path and os.path.exists(path):
-        try:
-            if path.lower().endswith((".xlsx",".xlsm",".xls")):
-                df = pd.read_excel(path, engine="openpyxl")
-            else:
-                df = pd.read_csv(path)
-        except Exception:
-            df = None
+def try_parse_gs1_paren(s: str) -> Optional[Dict[str,str]]:
+    # Supports (21)=pallet, (10)=lot, (01)=gtin
+    pairs = re.findall(r"\((\d{2,4})\)([^\(\)]+)", s)
+    if not pairs:
+        return None
+    out: Dict[str,str] = {}
+    for ai, val in pairs:
+        val = val.strip()
+        if ai == "21": out["pallet"] = val
+        elif ai == "10": out["lot"] = val
+        elif ai == "01": out["gtin"] = val
+    return out or None
 
-    if df is not None and len(df) > 0:
-        df.columns = [str(c).strip() for c in df.columns]
-        guessed = _auto_guess_cols(list(df.columns))
-        return df, guessed
-    return None, None
-
-def lookup_fields_by_pallet(df, colmap: Dict[str, Optional[str]], pallet_id: str) -> Dict[str,str]:
-    out = {}
-    if df is None or not pallet_id:
-        return out
-    pcol = colmap.get("pallet")
-    if not pcol or pcol not in df.columns:
-        return out
-    # Normalize for compare
-    needle = str(pallet_id).strip().upper()
-    try:
-        subset = df[df[pcol].astype(str).str.upper().str.strip() == needle]
-        if not subset.empty:
-            row = subset.iloc[0]
-            sku_col = colmap.get("sku")
-            lot_col = colmap.get("lot")
-            loc_col = colmap.get("location")
-            if sku_col and sku_col in df.columns:
-                out["sku"] = str(row[sku_col]).strip()
-            if lot_col and lot_col in df.columns:
-                out["lot"] = normalize_lot(str(row[lot_col]))
-            if loc_col and loc_col in df.columns:
-                out["location"] = str(row[loc_col]).strip()
-    except Exception:
-        pass
+def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
+    key_map = {
+        "location": ["location","loc","bin","slot","staging","stg"],
+        "pallet":   ["pallet","pallet_id","serial","id","license","lpn","sscc"],
+        "sku":      ["sku","item","itemcode","product","part","material"],
+        "lot":      ["lot","lot_number","batch","batchno"],
+    }
+    out: Dict[str,str] = {}
+    lower_data = {k.lower(): str(v) for k, v in data.items()}
+    for target, aliases in key_map.items():
+        for a in aliases:
+            if a in lower_data and lower_data[a]:
+                out[target] = lower_data[a].strip()
+                break
+    if "lot" in out:
+        out["lot"] = normalize_lot(out["lot"])
     return out
 
 # ---------- SIDEBAR ----------
@@ -210,38 +180,6 @@ with st.sidebar:
     st.markdown("### ⚙️ Settings")
     ss["operator"] = st.text_input("Operator (optional)", value=ss.operator, placeholder="e.g., Carlos")
     st.write("**Log file:**", f"`{LOG_FILE}`")
-    st.markdown("---")
-
-    st.markdown("#### Inventory Lookup (optional)")
-    st.caption("Use a CSV/XLSX to auto-fill SKU / LOT / Location from Pallet ID.")
-    uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv","xlsx","xls"], accept_multiple_files=False)
-    up_bytes = uploaded.read() if uploaded is not None else None
-
-    # Try: uploaded file first, else env path
-    df, guessed = load_lookup(LOOKUP_FILE_ENV if not up_bytes else None, up_bytes)
-    ss.lookup_df = df
-
-    if df is not None:
-        st.success(f"Loaded lookup with {len(df):,} rows")
-        # Column mapping controls
-        cols = list(df.columns)
-        g = guessed or {"pallet": None, "sku": None, "lot": None, "location": None}
-        c1, c2 = st.columns(2)
-        with c1:
-            ss.lookup_cols["pallet"]   = st.selectbox("Pallet column",   options=cols, index=cols.index(g["pallet"]) if g["pallet"] in cols else 0)
-            ss.lookup_cols["sku"]      = st.selectbox("SKU column",      options=["(none)"] + cols, index=(cols.index(g["sku"]) + 1) if g["sku"] in cols else 0)
-        with c2:
-            ss.lookup_cols["lot"]      = st.selectbox("LOT column",      options=["(none)"] + cols, index=(cols.index(g["lot"]) + 1) if g["lot"] in cols else 0)
-            ss.lookup_cols["location"] = st.selectbox("Location column", options=["(none)"] + cols, index=(cols.index(g["location"]) + 1) if g["location"] in cols else 0)
-
-        # Normalize "(none)" back to None
-        for k in ["sku","lot","location"]:
-            if ss.lookup_cols.get(k) == "(none)":
-                ss.lookup_cols[k] = None
-    else:
-        if LOOKUP_FILE_ENV:
-            st.warning(f"Could not load lookup from `{LOOKUP_FILE_ENV}`. Upload a file or check the path.")
-
     st.markdown("---")
     st.markdown("#### Start/Balance (optional)")
     ss["starting_qty"] = st.number_input(
@@ -253,88 +191,9 @@ with st.sidebar:
 
 # ---------- HEADER ----------
 st.title("📦 Picking Helper")
-st.caption("Scan QR → trim at 8304 → Pallet ID set → (optional) lookup fills SKU/LOT/Location → choose QTY staged → Log / Tag")
+st.caption("Scan QR → trim at 8304 → auto-fill Pallet / Location / SKU / LOT → choose QTY staged → Log / Tag")
 
-# ---------- SCAN HANDLER ----------
-def on_scan():
-    raw = ss.scan or ""
-    code = clean_scan(raw)
-    if not code:
-        return
-
-    # Always trim at first '8304'
-    trimmed, was_trimmed = apply_start_marker(code, START_MARKER)
-
-    # After lock: treat trimmed as primary Pallet ID.
-    pallet_id = trimmed
-
-    # Set pallet first
-    ss.current_pallet = pallet_id
-
-    # Try to parse extra info if any key=value present after 8304 (optional)
-    extra = {}
-    if "=" in trimmed or "&" in trimmed or ";" in trimmed or "|" in trimmed or "?" in trimmed:
-        # Accept url or query string formats after 8304
-        # ex: 8304pallet=JTL00496&location=11100101&sku=ABC123&lot=9062716
-        # Strip leading '8304' if it's followed by keys
-        after = trimmed[4:] if trimmed.startswith("8304") else trimmed
-        # If starts directly with key=, parse; else just fallback
-        try:
-            if "://" in after:
-                parsed = urlparse(after)
-                qs = parse_qs(parsed.query, keep_blank_values=True)
-                extra = {k.lower(): unquote_plus(v[-1]) if v else "" for k, v in qs.items()}
-            else:
-                sep_standardized = after.replace(";", "&").replace("|", "&")
-                parts = [p for p in sep_standardized.split("&") if p]
-                kv = {}
-                for p in parts:
-                    if "=" in p:
-                        k, v = p.split("=", 1)
-                        kv[k.strip().lower()] = unquote_plus(v.strip())
-                extra = kv
-        except Exception:
-            extra = {}
-
-    # Apply direct extras if present
-    sku = extra.get("sku")
-    lot = extra.get("lot") or extra.get("lot_number")
-    loc = extra.get("location") or extra.get("loc") or extra.get("bin")
-    if lot: lot = normalize_lot(lot)
-
-    # If not provided by QR, try lookup
-    if ss.lookup_df is not None:
-        lookup_map = {
-            "pallet": ss.lookup_cols.get("pallet"),
-            "sku": ss.lookup_cols.get("sku"),
-            "lot": ss.lookup_cols.get("lot"),
-            "location": ss.lookup_cols.get("location"),
-        }
-        looked = lookup_fields_by_pallet(ss.lookup_df, lookup_map, pallet_id)
-        sku = sku or looked.get("sku")
-        lot = lot or looked.get("lot")
-        loc = loc or looked.get("location")
-
-    # Commit to session
-    if loc: ss.current_location = loc
-    if sku is not None: ss.sku = sku or ""
-    if lot is not None: ss.lot_number = lot or ""
-
-    # Toast summary
-    bits = [f"Pallet {pallet_id}"]
-    if loc: bits.append(f"Location {loc}")
-    if sku: bits.append(f"SKU {sku}")
-    if lot: bits.append(f"LOT {lot}")
-    if was_trimmed: bits.insert(0, f"Trimmed at '{START_MARKER}'")
-    st.toast(" | ".join(bits), icon="✅")
-
-    # History + clear
-    ss.recent_scans.insert(0, (datetime.now().strftime("%H:%M:%S"), trimmed if was_trimmed else code))
-    ss.recent_scans = ss.recent_scans[:25]
-    ss.scan = ""
-
-# ---------- UI ----------
-# auto-focus
+# ---------- Auto-focus ----------
 st.markdown("""
 <script>
   const focusScan = () => {
@@ -345,11 +204,62 @@ st.markdown("""
 </script>
 """, unsafe_allow_html=True)
 
+# ---------- SCAN HANDLER ----------
+def on_scan():
+    raw = ss.scan or ""
+    code = clean_scan(raw)
+    if not code:
+        return
+
+    # 1) Lock trim at '8304'
+    trimmed, was_trimmed = apply_start_marker(code, START_MARKER)
+    # after marker (remove exactly the marker itself if at start)
+    after = trimmed[len(START_MARKER):] if trimmed.startswith(START_MARKER) else trimmed
+
+    # 2) Try rich parses on "after"
+    parsed = (try_parse_json(after)
+              or try_parse_query_or_kv(after)
+              or try_parse_gs1_paren(after)
+              or {})
+
+    norm = normalize_keys(parsed) if parsed else {}
+
+    # 3) Resolve fields, preferring parsed keys; fallback to treating "after" as bare Pallet ID
+    pallet_val = norm.get("pallet")
+    location = norm.get("location")
+    sku       = norm.get("sku")
+    lot       = norm.get("lot")
+
+    # If no 'pallet' key parsed, assume the remainder is the pallet id
+    if not pallet_val:
+        pallet_val = after.strip()
+
+    # Commit to session (Option 1 behavior)
+    ss.current_pallet = pallet_val or ss.current_pallet
+    if location: ss.current_location = location
+    if sku is not None: ss.sku = sku or ""
+    if lot is not None: ss.lot_number = lot or ""
+
+    # Toast summary
+    bits = []
+    if was_trimmed: bits.append(f"Trimmed at '{START_MARKER}'")
+    bits.append(f"Pallet {ss.current_pallet}")
+    if ss.current_location: bits.append(f"Location {ss.current_location}")
+    if ss.sku: bits.append(f"SKU {ss.sku}")
+    if ss.lot_number: bits.append(f"LOT {ss.lot_number}")
+    st.toast(" | ".join(bits), icon="✅")
+
+    # History + clear
+    ss.recent_scans.insert(0, (datetime.now().strftime("%H:%M:%S"), trimmed))
+    ss.recent_scans = ss.recent_scans[:25]
+    ss.scan = ""
+
+# ---------- UI ----------
 st.subheader("Scan")
 st.text_input(
     "Scan here",
     key="scan",
-    placeholder="Focus here and scan… (app trims at 8304)",
+    placeholder="Focus here and scan… (app trims at 8304 and parses keys)",
     label_visibility="collapsed",
     on_change=on_scan
 )
@@ -390,7 +300,7 @@ with colq7:
                                  value=st.session_state.get("qty_staged", 0),
                                  help="Select a chip or type a custom staged quantity.")
     st.session_state["qty_staged"] = qty_staged
-st.caption("Only QTY staged is chosen by the user. Everything else auto-fills.")
+st.caption("Only QTY staged is chosen by the user. Everything else auto-fills from the QR.")
 
 # Pick section
 st.subheader("Pick")
@@ -411,7 +321,7 @@ with colC:
 # Actions
 if do_log:
     if not ss.current_location:
-        st.error("Scan a **Location** first (or ensure lookup provides Location).")
+        st.error("Scan a **Location** first (or include it in the QR).")
     elif not ss.current_pallet:
         st.error("Scan a **Pallet ID** next.")
     elif st.session_state.get("qty_staged", 0) <= 0 and pick_qty <= 0:
