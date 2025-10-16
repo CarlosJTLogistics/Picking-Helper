@@ -4,6 +4,7 @@ import io
 import re
 import json
 import csv
+from typing import Optional, Dict
 from urllib.parse import urlparse, parse_qs, unquote_plus
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,8 @@ defaults = {
     "recent_scans": [],
     "tag_bytes": None,
     "scan": "",
+    "qty_staged": 0,
+    "chosen_quick": None,
 }
 for k, v in defaults.items():
     if k not in ss:
@@ -54,12 +57,10 @@ def append_log_row(row: dict):
     # Append to CSV on disk safely (header on first write)
     file_exists = os.path.isfile(LOG_FILE)
     with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        # Ensure a stable field order for readability
         field_order = [
             "timestamp","operator","location","pallet_id","sku","lot_number",
             "qty_staged","qty_picked","starting_qty","remaining_after"
         ]
-        # fill missing keys
         for k in field_order:
             row.setdefault(k, "")
         writer = csv.DictWriter(f, fieldnames=field_order)
@@ -67,13 +68,12 @@ def append_log_row(row: dict):
             writer.writeheader()
         writer.writerow({k: row.get(k, "") for k in field_order})
 
-def make_partial_tag_png(location: str, pallet: str, qty_remaining: int|None, operator: str) -> bytes:
+def make_partial_tag_png(location: str, pallet: str, qty_remaining: Optional[int], operator: str) -> bytes:
     # Simple, bold tag you can print or show on screen
     W, H = 800, 500
     bg = (249, 249, 249)
     img = Image.new("RGB", (W, H), bg)
     d = ImageDraw.Draw(img)
-    # Try system font fallback
     try:
         font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 48)
         font_body  = ImageFont.truetype("DejaVuSans.ttf", 34)
@@ -98,7 +98,6 @@ def make_partial_tag_png(location: str, pallet: str, qty_remaining: int|None, op
     if operator:
         d.text((24, y), f"By: {operator}", font=font_small, fill=(80,80,80))
 
-    # Footer stripe
     d.rectangle([0, H-18, W, H], fill=(6, 83, 164))
 
     b = io.BytesIO()
@@ -109,13 +108,13 @@ def upsert_picked(pallet_id: str, qty: int):
     current = ss.picked_so_far.get(pallet_id, 0)
     ss.picked_so_far[pallet_id] = current + qty
 
-def get_remaining(starting: int|None, pallet_id: str) -> int|None:
+def get_remaining(starting: Optional[int], pallet_id: str) -> Optional[int]:
     if starting is None:
         return None
     picked = ss.picked_so_far.get(pallet_id, 0)
     return max(starting - picked, 0)
 
-def normalize_lot(lot: str|None) -> str:
+def normalize_lot(lot: Optional[str]) -> str:
     """LOT Number normalized to whole numeric strings (strip non-digits and leading zeros)."""
     if not lot:
         return ""
@@ -124,21 +123,22 @@ def normalize_lot(lot: str|None) -> str:
     return digits
 
 # ---- QR Parsing ----
-def try_parse_json(s: str) -> dict|None:
+def try_parse_json(s: str) -> Optional[Dict]:
     try:
-        return json.loads(s)
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+        return None
     except Exception:
         return None
 
-def try_parse_query_or_kv(s: str) -> dict|None:
+def try_parse_query_or_kv(s: str) -> Optional[Dict]:
     # Accept full URLs, querystrings, or simple "k=v&k2=v2" | "k=v;k2=v2" | "k=v|k2=v2"
     if "://" in s:
-        # looks like a URL with query
         parsed = urlparse(s)
         qs = parse_qs(parsed.query, keep_blank_values=True)
         return {k.lower(): unquote_plus(v[-1]) if v else "" for k, v in qs.items()} or None
 
-    # Replace common separators with &
     sep_standardized = s.replace(";", "&").replace("|", "&")
     if "=" in sep_standardized:
         parts = [p for p in sep_standardized.split("&") if p]
@@ -150,7 +150,7 @@ def try_parse_query_or_kv(s: str) -> dict|None:
         return kv or None
     return None
 
-def try_parse_delimited(s: str) -> dict|None:
+def try_parse_delimited(s: str) -> Optional[Dict]:
     """
     Accept delimited without explicit keys if order is known:
     e.g., '11100101,JTL00496,ABC123,9062716' -> location,pallet,sku,lot
@@ -159,19 +159,16 @@ def try_parse_delimited(s: str) -> dict|None:
     tokens = re.split(r"[,\t|;]+", s)
     tokens = [t.strip() for t in tokens if t.strip()]
     if 2 <= len(tokens) <= 6:
-        # Heuristic: location if 8-digit numeric
-        d = {}
+        d: Dict[str, str] = {}
         for t in tokens:
             if is_location(t):
                 d["location"] = t
             elif re.fullmatch(r"[A-Za-z0-9\-]+", t) and "pallet" not in d:
                 d["pallet"] = t
-            # sku: if remaining token is alnum and not purely digits of len 8
-        if d:
-            return d
+        return d or None
     return None
 
-def try_parse_gs1(s: str) -> dict|None:
+def try_parse_gs1(s: str) -> Optional[Dict]:
     """
     Very basic GS1 parser for (AI)(value) patterns:
       (01)=GTIN, (10)=LOT, (21)=Serial/Pallet
@@ -179,7 +176,7 @@ def try_parse_gs1(s: str) -> dict|None:
     pairs = re.findall(r"\((\d{2,4})\)([^\(\)]+)", s)
     if not pairs:
         return None
-    out = {}
+    out: Dict[str, str] = {}
     for ai, val in pairs:
         val = val.strip()
         if ai == "01":
@@ -188,10 +185,9 @@ def try_parse_gs1(s: str) -> dict|None:
             out["lot"] = val
         elif ai == "21":
             out["pallet"] = val
-        # Add more AIs as needed.
     return out or None
 
-def parse_qr_payload(s: str) -> dict:
+def parse_qr_payload(s: str) -> Dict[str, str]:
     """
     Try multiple strategies; return normalized dict with keys:
     location, pallet, sku, lot
@@ -204,6 +200,7 @@ def parse_qr_payload(s: str) -> dict:
         try_parse_delimited(raw),
     ]
     data = next((c for c in candidates if c), {})  # first successful parse or {}
+
     if not data:
         return {}
 
@@ -214,7 +211,7 @@ def parse_qr_payload(s: str) -> dict:
         "sku":      ["sku","item","itemcode","product","part","material"],
         "lot":      ["lot","lot_number","batch","batchno"],
     }
-    normalized = {}
+    normalized: Dict[str, str] = {}
     lower_data = {k.lower(): str(v) for k, v in data.items()}
     for target, aliases in key_map.items():
         for a in aliases:
@@ -266,12 +263,10 @@ def on_scan():
 
     parsed = parse_qr_payload(code)
 
-    # If the scan looks like an 8-digit numeric and no parsed location was found, treat as location
     if is_location(code) and "location" not in parsed:
         ss.current_location = code
         st.toast(f"Location set: {code}", icon="📍")
     elif parsed:
-        # Apply parsed fields
         loc = parsed.get("location")
         pal = parsed.get("pallet")
         sku = parsed.get("sku")
@@ -285,6 +280,7 @@ def on_scan():
             ss.sku = sku
         if lot is not None:
             ss.lot_number = lot
+
         toast_bits = []
         if loc: toast_bits.append(f"Location {loc}")
         if pal: toast_bits.append(f"Pallet {pal}")
@@ -293,14 +289,11 @@ def on_scan():
         msg = " | ".join(toast_bits) if toast_bits else code
         st.toast(f"Parsed: {msg}", icon="✅")
     else:
-        # Fallback: treat as pallet id
         ss.current_pallet = code
         st.toast(f"Pallet set: {code}", icon="🧵")
 
-    # Keep history
     ss.recent_scans.insert(0, (datetime.now().strftime("%H:%M:%S"), code))
     ss.recent_scans = ss.recent_scans[:25]
-    # Clear box for next scan
     ss.scan = ""
 
 # ---------- UI: SCAN BOX ----------
@@ -339,10 +332,8 @@ st.markdown("---")
 # ---------- QTY STAGED (your team chooses) ----------
 st.subheader("QTY staged")
 colq1, colq2, colq3, colq4, colq5, colq6, colq7 = st.columns([1,1,1,1,1,1,2])
-quick_vals = [1, 2, 3, 5, 10, 15]
-chosen_quick = st.session_state.get("chosen_quick", None)
 
-def _set_quick(v):
+def _set_quick(v: int):
     st.session_state["qty_staged"] = v
     st.session_state["chosen_quick"] = v
 
@@ -359,7 +350,6 @@ with colq7:
         min_value=0, step=1, value=st.session_state.get("qty_staged", 0),
         help="Select a chip or type a custom staged quantity."
     )
-    # keep state in sync
     st.session_state["qty_staged"] = qty_staged
 
 st.caption("Tip: Scanning fills Location/Pallet/SKU/LOT from the QR. Only QTY staged is chosen here.")
@@ -447,4 +437,3 @@ if os.path.exists(LOG_FILE):
     st.dataframe(df.tail(50), use_container_width=True, height=320)
 else:
     st.info("No log entries yet today.")
-``
