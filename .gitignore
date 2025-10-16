@@ -1,9 +1,22 @@
 ﻿# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 .venv/
-# Logs
-logs/
-# OS
+venv/
+env/
+ENV/
+pip-wheel-metadata/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS/Editor
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
+
+# Logs / data you don’t want in the repo
+logs/
+*.log
