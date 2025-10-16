@@ -1,11 +1,10 @@
-# app.py  —  Outbound Picking Helper (Batch Submit)
+# app.py  —  Outbound Picking Helper (Batch Submit) with Staging Scan + Email Recipients
 import os
 import io
 import re
 import json
 import csv
 import sys
-import uuid
 import time
 import platform
 from typing import Optional, Dict, Tuple, List
@@ -15,6 +14,7 @@ from pathlib import Path
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
+
 # ---------------- PAGE SETUP ----------------
 st.set_page_config(page_title="Picking Helper", page_icon="📦", layout="wide")
 
@@ -26,6 +26,21 @@ LOG_FILE = os.path.join(LOG_DIR, f"picking-log-{TODAY}.csv")
 
 # Power Automate webhook for Submit All
 WEBHOOK_URL = os.getenv("PICKING_HELPER_WEBHOOK_URL", "").strip()
+
+# Comma/semicolon separated list of email recipients for notifications
+NOTIFY_TO_ENV = os.getenv("PICKING_HELPER_NOTIFY_TO", "").strip()
+DEFAULT_NOTIFY_TO = [
+    "carlos.pacheco@jtlogistics.com",
+    "Alex.Miller@jtlogistics.com",
+    "Cody.Robles@JTlogistics.com",
+]
+def _parse_notify_to(s: str) -> List[str]:
+    if not s:
+        return DEFAULT_NOTIFY_TO
+    parts = re.split(r"[;,]", s)
+    return [p.strip() for p in parts if p.strip()]
+
+NOTIFY_TO = _parse_notify_to(NOTIFY_TO_ENV)
 
 # Kiosk mode (hide menu/footer)
 KIOSK = os.getenv("PICKING_HELPER_KIOSK", "0").strip() == "1"
@@ -48,26 +63,27 @@ defaults = {
     "picked_so_far": {},             # pallet_id -> picked qty sum (int)
     "recent_scans": [],
     "tag_bytes": None,
+
+    # live inputs
     "scan": "",
+    "staging_scan": "",              # NEW: dedicated staging barcode scan
     "qty_staged": 0,
     "chosen_quick": None,
+
+    # lookup
     "lookup_df": None,
     "lookup_cols": {"pallet": None, "sku": None, "lot": None, "location": None},
 
     # Outbound batch mode additions:
-    "current_order": "",
-    "staging_location_current": "",
-    "batch_rows": [],               # list[dict] pending submission lines
+    "current_order": "",             # optional by design
+    "staging_location_current": "",  # set by scan or manual
+    "batch_rows": [],                # list[dict] pending submission lines
 }
 for k, v in defaults.items():
     if k not in ss:
         ss[k] = v
 
 # --------------- HELPERS ----------------
-def is_location(code: str) -> bool:
-    c = (code or "").strip()
-    return c.isdigit() and len(c) == 8
-
 def clean_scan(raw: str) -> str:
     return (raw or "").replace("\r", "").replace("\n", "").strip()
 
@@ -232,18 +248,20 @@ def lookup_fields_by_pallet(df, colmap: Dict[str, Optional[str]], pallet_id: str
 
 # --------------- SIDEBAR ----------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.0", icon="🧭")
+    st.info("BUILD: outbound-batch v1.1 (staging scan + notify_to)", icon="🧭")
     st.markdown("### ⚙️ Settings")
 
     ss["operator"] = st.text_input("Operator (optional)", value=ss.operator, placeholder="e.g., Carlos")
-    ss["current_order"] = st.text_input("Current Order # (optional)", value=ss.current_order, placeholder="e.g., SO-12345")
-    ss["staging_location_current"] = st.text_input("Staging Location (optional)", value=ss.staging_location_current, placeholder="e.g., STAGE-01")
+    ss["current_order"] = st.text_input("Order # (optional)", value=ss.current_order, placeholder="e.g., SO-12345")
+    ss["staging_location_current"] = st.text_input("Staging Location (optional, can scan below)", value=ss.staging_location_current, placeholder="e.g., STAGE-01")
 
     st.write("**Log file:**", f"`{LOG_FILE}`")
     if WEBHOOK_URL:
         st.caption("Submit will POST to configured Power Automate webhook.")
     else:
         st.warning("PICKING_HELPER_WEBHOOK_URL is not set. Submit will only write CSV locally.")
+
+    st.caption(f"Email/Teams recipients: {', '.join(NOTIFY_TO)}")
 
     st.markdown("---")
 
@@ -263,7 +281,6 @@ with st.sidebar:
 
     if lookup_error:
         st.error(f"Lookup load error: {lookup_error}")
-        st.caption("Tip: Add requirements.txt with pandas/openpyxl/xlrd if needed, then redeploy.")
 
     if ss.lookup_df is not None:
         st.success(f"Loaded lookup with {len(ss.lookup_df):,} rows")
@@ -271,23 +288,14 @@ with st.sidebar:
         g = guessed or {"pallet": None, "sku": None, "lot": None, "location": None}
         c1, c2 = st.columns(2)
         with c1:
-            ss.lookup_cols["pallet"] = st.selectbox("Pallet column", options=cols, index=cols.index(g["pallet"]) if g["pallet"] in cols else 0)
-            ss.lookup_cols["sku"]    = st.selectbox("SKU column", options=["(none)"] + cols, index=(cols.index(g["sku"]) + 1) if g["sku"] in cols else 0)
+            ss.lookup_cols["pallet"]   = st.selectbox("Pallet column", options=cols, index=cols.index(g["pallet"]) if g["pallet"] in cols else 0)
+            ss.lookup_cols["sku"]      = st.selectbox("SKU column", options=["(none)"] + cols, index=(cols.index(g["sku"]) + 1) if g["sku"] in cols else 0)
         with c2:
-            ss.lookup_cols["lot"]    = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g["lot"]) + 1) if g["lot"] in cols else 0)
+            ss.lookup_cols["lot"]      = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g["lot"]) + 1) if g["lot"] in cols else 0)
             ss.lookup_cols["location"] = st.selectbox("Location column", options=["(none)"] + cols, index=(cols.index(g["location"]) + 1) if g["location"] in cols else 0)
         for k in ["sku","lot","location"]:
             if ss.lookup_cols.get(k) == "(none)":
                 ss.lookup_cols[k] = None
-        with st.expander("Preview lookup (first 10 rows)", expanded=False):
-            try:
-                import pandas as pd
-                st.dataframe(ss.lookup_df.head(10), use_container_width=True)
-            except Exception:
-                st.write(ss.lookup_df.head(10))
-    else:
-        if LOOKUP_FILE_ENV and not lookup_error:
-            st.warning(f"Could not load lookup from `{LOOKUP_FILE_ENV}`. Upload a file or check the path.")
 
     st.markdown("---")
     st.markdown("#### Start/Balance (optional)")
@@ -320,7 +328,7 @@ if KIOSK:
 
 # --------------- HEADER ----------------
 st.title("📦 Picking Helper — Outbound (Batch)")
-st.caption("Scan QR → trim at 8304 → Pallet set → (optional) lookup fills SKU/LOT/Location → choose QTY staged → Add to batch → Review & Submit")
+st.caption("Scan Pallet → (optional) lookup fills SKU/LOT/Location → set QTY staged (max 15) → scan Staging → Add to batch → Review & Submit")
 
 # Auto-focus first text input for scan guns (keyboard-wedge)
 st.markdown("""
@@ -388,7 +396,7 @@ def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
         out["lot"] = normalize_lot(out["lot"])
     return out
 
-def on_scan():
+def on_pallet_scan():
     raw = ss.scan or ""
     code = clean_scan(raw)
     if not code:
@@ -437,14 +445,24 @@ def on_scan():
     ss.recent_scans = ss.recent_scans[:25]
     ss.scan = ""
 
+def on_staging_scan():
+    raw = ss.staging_scan or ""
+    code = clean_scan(raw)
+    if not code:
+        return
+    # Staging barcodes are plain (e.g., STAGE-01). Just set it.
+    ss.staging_location_current = code
+    st.toast(f"Staging Location set: {code}", icon="📍")
+    ss.staging_scan = ""
+
 # --------------- MAIN UI ----------------
-st.subheader("Scan")
+st.subheader("Scan Pallet")
 st.text_input(
-    "Scan here",
+    "Scan pallet here",
     key="scan",
-    placeholder="Focus here and scan… (app trims at 8304; uses lookup if needed)",
+    placeholder="Focus here and scan pallet… (app trims at 8304; uses lookup if needed)",
     label_visibility="collapsed",
-    on_change=on_scan
+    on_change=on_pallet_scan
 )
 
 # Current context metrics
@@ -467,6 +485,23 @@ with st.expander("Recent scans", expanded=True):
 
 st.markdown("---")
 
+# NEW: Staging scan section
+st.subheader("Staging Location (scan or type)")
+col_s1, col_s2 = st.columns([2,1])
+with col_s1:
+    st.text_input(
+        "Scan staging location here",
+        key="staging_scan",
+        placeholder="Scan staging barcode (e.g., STAGE-01)…",
+        on_change=on_staging_scan
+    )
+with col_s2:
+    st.text_input("…or type staging", key="staging_location_current")
+
+st.caption("Tip: After you pick, scan the **staging location** barcode. It will be attached to the next line you add to the batch.")
+
+st.markdown("---")
+
 # QTY staged input
 st.subheader("QTY staged")
 colq = st.columns([1,1,1,1,1,1,2])
@@ -480,9 +515,9 @@ for i, lb in enumerate(labels):
 with colq[-1]:
     qty_staged = st.number_input("or type a value", min_value=0, step=1,
                                  value=st.session_state.get("qty_staged", 0),
-                                 help="Select a chip or type a custom staged quantity.")
+                                 help="Select a chip or type a custom staged quantity (max 15).")
     st.session_state["qty_staged"] = qty_staged
-st.caption("Only QTY staged is chosen by the user. Everything else auto-fills from QR or lookup.")
+st.caption("Only QTY staged is chosen by the user. Everything else auto-fills from QR or lookup. Max 15 per line.")
 
 # Pick (optional running tracker remains)
 st.subheader("Pick (optional tracker)")
@@ -520,9 +555,9 @@ if add_to_batch:
         if pick_qty > 0:
             upsert_picked(ss.current_pallet, int(pick_qty))
         line = {
-            "order_number": ss.current_order or "",
+            "order_number": ss.current_order or "",                  # OPTIONAL
             "source_location": ss.current_location,
-            "staging_location": ss.staging_location_current or "",
+            "staging_location": ss.staging_location_current or "",   # from scan or typed
             "pallet_id": ss.current_pallet,
             "sku": ss.sku or "",
             "lot_number": ss.lot_number or "",
@@ -530,8 +565,10 @@ if add_to_batch:
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         ss.batch_rows.append(line)
-        st.success(f"Added to batch: Pallet {line['pallet_id']} — QTY {line['qty_staged']}"
-                   + (f" → {line['staging_location']}" if line["staging_location"] else ""))
+        st.success(
+            f"Added to batch: Pallet {line['pallet_id']} — QTY {line['qty_staged']}"
+            + (f" → {line['staging_location']}" if line['staging_location'] else "")
+        )
         # Reset qty staged only
         st.session_state["qty_staged"] = 0
         st.session_state["chosen_quick"] = None
@@ -576,17 +613,16 @@ else:
         import pandas as pd
         df_batch = pd.DataFrame(ss.batch_rows)
     except Exception:
-        # minimal fallback
         df_batch = None
 
     if df_batch is not None:
-        st.caption("Tip: Edit QTY staged or Staging Location directly below, then click **Apply Edits**.")
+        st.caption("Edit QTY or Staging below (0 qty lines are dropped). Then **Apply Edits** → **Submit All**.")
         edited = st.data_editor(
             df_batch,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "order_number": "Order #",
+                "order_number": "Order # (optional)",
                 "source_location": "Source Location",
                 "staging_location": "Staging Location",
                 "pallet_id": "Pallet ID",
@@ -604,7 +640,6 @@ else:
         with colR2:
             submit_all = st.button("✅ Submit All", use_container_width=True)
         with colR3:
-            # compute quick totals
             try:
                 total_lines = len(edited)
                 total_qty = int(edited["qty_staged"].sum())
@@ -614,15 +649,13 @@ else:
             st.metric("Batch Totals", f"{total_lines} lines / {total_qty} cases")
 
         if apply_edits:
-            # validate and save back to session
             new_rows = []
             for _, r in edited.iterrows():
                 qty = int(r.get("qty_staged", 0) or 0)
                 if qty <= 0:
-                    # drop rows with 0 or negative qty
                     continue
                 if qty > 15:
-                    st.error(f"Line for pallet {r.get('pallet_id','?')}: qty {qty} > 15 (max). Not applied.")
+                    st.error(f"Line for pallet {r.get('pallet_id','?')}: qty {qty} > 15 (max). Using 15.")
                     qty = 15
                 new_rows.append({
                     "order_number": str(r.get("order_number","")),
@@ -637,33 +670,31 @@ else:
             ss.batch_rows = new_rows
             st.success("Edits applied.")
 
-        # -------- Submit All --------
         if submit_all:
             if not ss.batch_rows:
                 st.error("Batch is empty.")
             else:
-                # Validate required fields
                 bad = []
                 for r in ss.batch_rows:
                     if not r.get("pallet_id") or not r.get("source_location"):
                         bad.append(r)
-                    if int(r.get("qty_staged", 0)) <= 0 or int(r.get("qty_staged", 0)) > 15:
+                    q = int(r.get("qty_staged", 0))
+                    if q <= 0 or q > 15:
                         bad.append(r)
                 if bad:
                     st.error("Some lines are invalid (missing pallet/location or qty not in 1–15). Fix and try again.")
                 else:
-                    # Build payload
                     batch_id = f"BATCH-{datetime.now().isoformat(timespec='seconds')}-{(ss.operator or 'operator')}".replace(":", "")
-                    device = "browser"
                     submitted_at = datetime.now().isoformat(timespec="seconds")
                     totals_qty = sum(int(r["qty_staged"]) for r in ss.batch_rows)
                     payload = {
                         "batch_id": batch_id,
                         "submitted_at": submitted_at,
                         "operator": ss.operator or "",
-                        "device": device,
                         "rows": ss.batch_rows,
                         "totals": {"lines": len(ss.batch_rows), "qty_staged_sum": totals_qty},
+                        # NEW: recipients list for the Flow to email/Teams
+                        "notify_to": NOTIFY_TO,
                     }
 
                     # Send to webhook (if configured)
@@ -690,9 +721,9 @@ else:
                             "sku": r.get("sku",""),
                             "lot_number": r.get("lot_number",""),
                             "qty_staged": int(r.get("qty_staged", 0)) or "",
-                            "qty_picked": "",  # optional tracker is not recorded per line at submit
+                            "qty_picked": "",
                             "starting_qty": (ss.starting_qty if ss.starting_qty != 0 else ""),
-                            "remaining_after": "",  # computed per pallet if you want; omitted here
+                            "remaining_after": "",
                             "batch_id": batch_id,
                             "action": "SUBMIT",
                         })
@@ -709,7 +740,6 @@ else:
                     else:
                         st.success("Submitted! Admin will receive the email/Teams notification.")
                         ss.batch_rows = []
-                        # small toast and rerun to clear editor
                         st.toast(f"Batch {batch_id} submitted — {payload['totals']['lines']} lines / {payload['totals']['qty_staged_sum']} cases.", icon="📨")
                         time.sleep(0.5)
                         st.experimental_rerun()
