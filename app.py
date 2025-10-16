@@ -1,4 +1,4 @@
-# Picking Helper – Streamlit prototype (with Scan Mode)
+# Picking Helper – Streamlit prototype
 # Author: M365 Copilot for Carlos Pacheco
 # Date: 2025-10-16
 # Purpose: Bridge process to record partial picks and generate partial pallet tags without changing WMS (RAMP)
@@ -9,7 +9,6 @@ import re
 import uuid
 import json
 from datetime import datetime
-from urllib.parse import parse_qs
 
 import pandas as pd
 import streamlit as st
@@ -20,14 +19,6 @@ try:
     HAS_PDF = True
 except Exception:
     HAS_PDF = False
-
-# Optional: QR generation (not required for parsing scans)
-try:
-    import qrcode
-    from PIL import Image
-    HAS_QR = True
-except Exception:
-    HAS_QR = False
 
 APP_NAME = "Picking Helper"
 FULL_PALLET_DEFAULT = 15  # default cases on a full pallet
@@ -53,6 +44,7 @@ def get_default_log_dir() -> str:
       2) OneDrive - JT Logistics/picking-helper/logs under user home
       3) ./logs under current working directory
     """
+    # 1) Environment override
     for env_key in ("PICKING_HELPER_LOG_DIR", "BIN_HELPER_LOG_DIR"):
         path = os.environ.get(env_key)
         if path:
@@ -64,13 +56,16 @@ def get_default_log_dir() -> str:
                 os.remove(testfile)
                 return path
             except Exception:
-                pass
+                pass  # try next option
+
+    # 2) OneDrive convention
     primary = os.path.join(
         os.path.expanduser("~"),
         "OneDrive - JT Logistics",
         "picking-helper",
         "logs",
     )
+    # 3) Local fallback
     secondary = os.path.join(os.getcwd(), "logs")
 
     for path in (primary, secondary):
@@ -84,6 +79,7 @@ def get_default_log_dir() -> str:
         except Exception:
             continue
 
+    # Last resort: current dir
     return os.getcwd()
 
 def csv_paths(base_dir: str) -> dict:
@@ -94,6 +90,7 @@ def csv_paths(base_dir: str) -> dict:
     }
 
 def init_storage(paths: dict):
+    # Picks log schema
     if not os.path.exists(paths["picks"]):
         pd.DataFrame(
             columns=[
@@ -103,6 +100,7 @@ def init_storage(paths: dict):
             ]
         ).to_csv(paths["picks"], index=False)
 
+    # Partial pallets schema
     if not os.path.exists(paths["partials"]):
         pd.DataFrame(
             columns=[
@@ -111,6 +109,7 @@ def init_storage(paths: dict):
             ]
         ).to_csv(paths["partials"], index=False)
 
+    # Config
     if not os.path.exists(paths["config"]):
         cfg = {
             "full_pallet_cases": FULL_PALLET_DEFAULT,
@@ -154,163 +153,6 @@ def next_cases_before_for_pallet(partials_df: pd.DataFrame, pallet_id: str) -> i
     except Exception:
         return FULL_PALLET_DEFAULT
 
-# ----------------------------
-# Scan payload parsing
-# ----------------------------
-
-KEY_ALIASES = {
-    "PID": ["PID", "PALLET", "PAL", "PALLET_ID", "PALLETID"],
-    "SKU": ["SKU", "ITEM", "PART"],
-    "LOT": ["LOT", "LOT_NUMBER", "LOTNO", "LN"],
-    "QTY": ["QTY", "QUANTITY", "Q"],
-    "FROM": ["FROM", "LOC_FROM", "LOCATION_FROM", "BIN_FROM", "LOC", "BIN"],
-    "TO": ["TO", "LOC_TO", "LOCATION_TO", "STAGE", "STAGING", "STAGING_LOC"],
-    "ORDER": ["ORDER", "SO", "WAVE", "ORDER_ID", "WAVE_ID"],
-    "PICKER": ["PICKER", "USER", "EMP", "PICKER_ID"],
-    "TAG": ["TAG", "TAG_ID"],
-}
-
-def _key_to_canonical(k: str) -> str | None:
-    k_up = (k or "").strip().upper()
-    for canon, aliases in KEY_ALIASES.items():
-        if k_up in aliases:
-            return canon
-    return None
-
-def parse_scan_payload(payload: str) -> dict:
-    """
-    Accepts several formats and returns a dict with canonical keys:
-      PID, SKU, LOT, QTY, FROM, TO, ORDER, PICKER, TAG
-    Supported formats:
-      - key:value or key=value separated by | , space
-      - querystring: PID=...&QTY=...
-      - JSON object: {"PID":"...","QTY":5}
-      - Light GS1 hints: (not full GS1) try to detect QTY as (37)=n, LOT as (10)=..., PID as (21)=...
-    """
-    result = {}
-    if not payload or not isinstance(payload, str):
-        return result
-
-    s = payload.strip()
-
-    # Try JSON
-    if s.startswith("{") and s.endswith("}"):
-        try:
-            obj = json.loads(s)
-            for k, v in obj.items():
-                canon = _key_to_canonical(k)
-                if canon:
-                    result[canon] = str(v).strip()
-            # Normalize LOT
-            if "LOT" in result:
-                result["LOT"] = normalize_lot_number(result["LOT"])
-            return result
-        except Exception:
-            pass
-
-    # Try querystring (allows & or ;)
-    if "=" in s and ("&" in s or ";" in s):
-        try:
-            qs = parse_qs(s.replace(";", "&"), keep_blank_values=True)
-            for k, vlist in qs.items():
-                canon = _key_to_canonical(k)
-                if canon and vlist:
-                    result[canon] = str(vlist[0]).strip()
-            if "LOT" in result:
-                result["LOT"] = normalize_lot_number(result["LOT"])
-            return result
-        except Exception:
-            pass
-
-    # Light GS1-style hints (VERY minimal, for convenience—not full spec)
-    # Common AIs (not exhaustive): (10)=lot, (37)=qty, (21)=serial (we'll map to PID if present)
-    # Accept formats like "(10)9062716 (37)5 (21)JTL00496"
-    if "(" in s and ")" in s:
-        try:
-            pairs = re.findall(r"\((\d+)\)\s*([^\s]+)", s)
-            for ai, val in pairs:
-                if ai == "10":   # LOT
-                    result["LOT"] = normalize_lot_number(val)
-                elif ai == "37": # QTY
-                    result["QTY"] = re.sub(r"[^0-9]", "", val)
-                elif ai == "21": # Serial → use as PID fallback
-                    result["PID"] = val
-            if result:
-                return result
-        except Exception:
-            pass
-
-    # Generic delimited "key:value" or "key=value" split by | , or whitespace
-    tokens = re.split(r"[|,\s]+", s)
-    for tok in tokens:
-        if not tok:
-            continue
-        if ":" in tok:
-            k, v = tok.split(":", 1)
-        elif "=" in tok:
-            k, v = tok.split("=", 1)
-        else:
-            # Loose tokens: try to catch QTY like "QTY5" or "PIDJTL00496"
-            m = re.match(r"([A-Za-z_]+)(.+)", tok)
-            if m:
-                k, v = m.group(1), m.group(2)
-            else:
-                continue
-        canon = _key_to_canonical(k)
-        if canon:
-            result[canon] = v.strip()
-
-    # Normalize known fields
-    if "LOT" in result:
-        result["LOT"] = normalize_lot_number(result["LOT"])
-    if "QTY" in result:
-        q = re.sub(r"[^0-9]", "", str(result["QTY"]))
-        result["QTY"] = q
-
-    return result
-
-# ----------------------------
-# Optional QR: encode tag dict to a compact payload (for labels)
-# ----------------------------
-
-def encode_qr_payload_from_tag(tag: dict) -> str:
-    """
-    Compact schema for our labels (what we parse in Scan Mode):
-      PID:<pallet>|SKU:<sku>|LOT:<lot>|QTY:<remaining>|FROM:<loc>|ORDER:<order>|TAG:<tag_id>
-    """
-    parts = []
-    if tag.get("pallet_id"): parts.append(f"PID:{tag['pallet_id']}")
-    if tag.get("sku"): parts.append(f"SKU:{tag['sku']}")
-    if tag.get("lot_number"): parts.append(f"LOT:{tag['lot_number']}")
-    if tag.get("remaining_cases") is not None: parts.append(f"QTY:{tag['remaining_cases']}")
-    if tag.get("location_current"): parts.append(f"FROM:{tag['location_current']}")
-    if tag.get("order_id"): parts.append(f"ORDER:{tag['order_id']}")
-    if tag.get("tag_id"): parts.append(f"TAG:{tag['tag_id']}")
-    return "|".join(parts)
-
-def make_qr_png_bytes(data: str) -> bytes:
-    if not HAS_QR:
-        return b""
-    qr = qrcode.QRCode(version=2, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=2)
-    qr.add_data(data)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")  # PIL Image
-    bio = io.BytesIO()
-    img.save(bio, format="PNG")
-    return bio.getvalue()
-
-def insert_png_on_pdf(page, x, y, png_bytes: bytes, width: float = 120):
-    """Insert a PNG image at (x,y) with width; height auto from aspect."""
-    if not png_bytes:
-        return
-    # fitz can insert image from a stream
-    rect = fitz.Rect(x, y, x + width, y + width)  # square QR area
-    page.insert_image(rect, stream=png_bytes)
-
-# ----------------------------
-# PDF tag (with optional QR)
-# ----------------------------
-
 def make_tag_pdf_bytes(tag: dict) -> bytes:
     """Create a simple PDF tag (A5-ish) and return bytes. Requires pymupdf."""
     if not HAS_PDF:
@@ -346,16 +188,6 @@ def make_tag_pdf_bytes(tag: dict) -> bytes:
     draw_label("Order", tag.get("order_id", ""), y); y += 22
     draw_label("Picker", tag.get("picker", ""), y); y += 22
     draw_label("Generated", tag.get("created_at", datetime.utcnow().isoformat()), y)
-
-    # Optional QR on the right
-    try:
-        payload = encode_qr_payload_from_tag(tag)
-        if payload and HAS_QR:
-            png_bytes = make_qr_png_bytes(payload)
-            insert_png_on_pdf(page, x=420, y=70, png_bytes=png_bytes, width=140)
-            page.insert_text((420, 220), "Scan to autofill", fontsize=10, color=(0,0,0))
-    except Exception:
-        pass
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -396,9 +228,9 @@ init_storage(PATHS)
 
 st.sidebar.success(f"Active log directory:\n{LOG_DIR}")
 
-# Load data
-picks_df = safe_read_csv(PATHS["picks"]) or pd.DataFrame()
-partials_df = safe_read_csv(PATHS["partials"]) or pd.DataFrame()
+# Load data (FIX: no 'or pd.DataFrame()' here)
+picks_df = safe_read_csv(PATHS["picks"])
+partials_df = safe_read_csv(PATHS["partials"])
 
 st.title("📦 Picking Helper (Prototype)")
 
@@ -437,38 +269,7 @@ pick_tab, partials_tab, export_tab, admin_tab = st.tabs(
 
 with pick_tab:
     st.subheader("Scan & Pick")
-    st.caption("Use your scan gun like a keyboard. Enter the exact quantity you picked, or use Scan Mode to autofill.")
-
-    # --- Scan Mode (QR/Barcode) ---
-    with st.expander("🔍 Scan Mode (QR/Barcode) – paste or scan a single string to autofill", expanded=False):
-        scan_payload = st.text_input(
-            "Scan payload",
-            key="scan_payload",
-            placeholder="Example: PID:JTL00496|QTY:5|LOT:9062716|FROM:11400801|TO:STAGE-A|SKU:ABC123|ORDER:SO123|PICKER:CP",
-            help="Scan a QR/barcode that encodes key:value pairs (|, space, or commas as separators). JSON and querystring also work."
-        )
-        parse_now = st.button("Parse Scan")
-        if parse_now and scan_payload:
-            parsed = parse_scan_payload(scan_payload)
-            # Update session state to populate inputs below
-            mapping = {
-                "PID": "pallet_id",
-                "FROM": "loc_from",
-                "TO": "loc_to",
-                "PICKER": "picker",
-                "SKU": "sku",
-                "LOT": "lot",
-                "ORDER": "order",
-            }
-            for k_src, k_dest in mapping.items():
-                if k_src in parsed:
-                    st.session_state[k_dest] = parsed[k_src]
-            if "QTY" in parsed:
-                try:
-                    st.session_state["qty_parsed"] = int(parsed["QTY"])
-                except Exception:
-                    st.session_state["qty_parsed"] = None
-            st.info(f"Parsed fields: {', '.join(parsed.keys()) or 'none'}")
+    st.caption("Use your scan gun like a keyboard. Enter the exact quantity you picked.")
 
     # Pre-fill cases_before from last known remaining for this pallet
     pallet_input = st.text_input(
@@ -504,9 +305,7 @@ with pick_tab:
             "Cases on Pallet (before pick)", min_value=1, max_value=9999, value=int(default_cases_before)
         )
     with col5:
-        # If Scan Mode parsed qty, default to that for convenience
-        default_qty = int(st.session_state.get("qty_parsed", 1)) if isinstance(st.session_state.get("qty_parsed"), int) else 1
-        qty_picked = st.number_input("Quantity Picked (cases)", min_value=1, max_value=9999, value=default_qty)
+        qty_picked = st.number_input("Quantity Picked (cases)", min_value=1, max_value=9999, value=1)
     with col6:
         note = st.text_input("Note (optional)")
 
@@ -582,8 +381,6 @@ with pick_tab:
                 )
             else:
                 st.code(json.dumps(tag_dict, indent=2), language="json")
-        # Clear parsed qty after submit
-        st.session_state["qty_parsed"] = None
         st.rerun()
 
 with partials_tab:
