@@ -21,6 +21,9 @@ LOG_DIR = os.getenv("PICKING_HELPER_LOG_DIR", "logs")
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"picking-log-{TODAY}.csv")
 
+# Start-marker: default "8304", can be overridden by env and in sidebar
+DEFAULT_START_MARKER = os.getenv("PICKING_HELPER_START_MARKER", "8304")
+
 # ---------- SESSION STATE ----------
 ss = st.session_state
 defaults = {
@@ -36,6 +39,7 @@ defaults = {
     "scan": "",
     "qty_staged": 0,
     "chosen_quick": None,
+    "start_marker": DEFAULT_START_MARKER,
 }
 for k, v in defaults.items():
     if k not in ss:
@@ -52,6 +56,18 @@ def is_location(code: str) -> bool:
 
 def clean_scan(raw: str) -> str:
     return (raw or "").replace("\r", "").replace("\n", "").strip()
+
+def apply_start_marker(s: str, marker: str) -> (str, bool):
+    """
+    Trim string to start at first occurrence of marker (inclusive).
+    Returns (trimmed_string, was_trimmed)
+    """
+    if not marker:
+        return s, False
+    idx = s.find(marker)
+    if idx >= 0:
+        return s[idx:], True
+    return s, False
 
 def append_log_row(row: dict):
     # Append to CSV on disk safely (header on first write)
@@ -231,6 +247,13 @@ with st.sidebar:
     ss["operator"] = st.text_input("Operator (optional)", value=ss.operator, placeholder="e.g., Carlos")
     st.write("**Log file:**", f"`{LOG_FILE}`")
     st.markdown("---")
+    st.markdown("#### Scan rules")
+    ss["start_marker"] = st.text_input(
+        "Start parsing at marker",
+        value=ss.start_marker or "",
+        help="Trim scans to start at the first occurrence of this text. Example: 8304"
+    )
+    st.caption("Anything before this marker is ignored.")
     st.markdown("#### Start/Balance (optional)")
     ss["starting_qty"] = st.number_input(
         "Starting qty on current pallet",
@@ -241,7 +264,7 @@ with st.sidebar:
 
 # ---------- HEADER ----------
 st.title("📦 Picking Helper")
-st.caption("Scan QR → auto-fill fields → choose QTY staged → (optional) enter qty picked → Generate Partial Tag → CSV Log")
+st.caption("Scan QR → auto-trim at marker → auto-fill fields → choose QTY staged → (optional) enter qty picked → Generate Tag → CSV Log")
 
 # ---------- OPTIONAL AUTO-FOCUS ----------
 st.markdown("""
@@ -261,11 +284,17 @@ def on_scan():
     if not code:
         return
 
-    parsed = parse_qr_payload(code)
+    # 1) Trim at marker (e.g., 8304)
+    marker = (ss.start_marker or "").strip()
+    trimmed, was_trimmed = apply_start_marker(code, marker)
 
-    if is_location(code) and "location" not in parsed:
-        ss.current_location = code
-        st.toast(f"Location set: {code}", icon="📍")
+    # 2) Parse the trimmed code
+    parsed = parse_qr_payload(trimmed)
+
+    # 3) Apply to context
+    if is_location(trimmed) and "location" not in parsed:
+        ss.current_location = trimmed
+        st.toast(f"Location set: {trimmed}", icon="📍")
     elif parsed:
         loc = parsed.get("location")
         pal = parsed.get("pallet")
@@ -282,17 +311,20 @@ def on_scan():
             ss.lot_number = lot
 
         toast_bits = []
+        if was_trimmed: toast_bits.append(f"Trimmed at '{marker}'")
         if loc: toast_bits.append(f"Location {loc}")
         if pal: toast_bits.append(f"Pallet {pal}")
         if sku: toast_bits.append(f"SKU {sku}")
         if lot: toast_bits.append(f"LOT {lot}")
-        msg = " | ".join(toast_bits) if toast_bits else code
-        st.toast(f"Parsed: {msg}", icon="✅")
+        msg = " | ".join(toast_bits) if toast_bits else trimmed
+        st.toast(f"{msg}", icon="✅")
     else:
-        ss.current_pallet = code
-        st.toast(f"Pallet set: {code}", icon="🧵")
+        # Fallback: treat the trimmed value as Pallet ID
+        ss.current_pallet = trimmed
+        st.toast(f"{'Trimmed → ' if was_trimmed else ''}Pallet set: {trimmed}", icon="🧵")
 
-    ss.recent_scans.insert(0, (datetime.now().strftime("%H:%M:%S"), code))
+    # History + clear
+    ss.recent_scans.insert(0, (datetime.now().strftime("%H:%M:%S"), trimmed if was_trimmed else code))
     ss.recent_scans = ss.recent_scans[:25]
     ss.scan = ""
 
@@ -301,7 +333,7 @@ st.subheader("Scan")
 st.text_input(
     "Scan here",
     key="scan",
-    placeholder="Focus here and scan location or pallet QR…",
+    placeholder="Focus here and scan… (the app will trim at the marker)",
     label_visibility="collapsed",
     on_change=on_scan
 )
@@ -352,7 +384,7 @@ with colq7:
     )
     st.session_state["qty_staged"] = qty_staged
 
-st.caption("Tip: Scanning fills Location/Pallet/SKU/LOT from the QR. Only QTY staged is chosen here.")
+st.caption("Only QTY staged is chosen by the user. Scans auto-fill everything else (after trimming at the marker).")
 
 # ---------- PICK ENTRY (optional running pick tracker) ----------
 st.subheader("Pick")
