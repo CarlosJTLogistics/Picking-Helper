@@ -1,6 +1,5 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.6.5 — 12-hour timestamps; optional Teams Incoming Webhook notify; preserves AIM/LOT/QTY defaults & auto-clear
-
+# v1.7.0 — Timezone-aware 12-hour timestamps (defaults to America/Chicago) + Teams webhook + preserves AIM/LOT/QTY defaults & auto-clear
 import os
 import io
 import re
@@ -28,7 +27,7 @@ def _get_cfg():
         return val
     cfg = {
         "webhook_url": get("webhook_url", "PICKING_HELPER_WEBHOOK_URL", ""),
-        "teams_webhook_url": get("teams_webhook_url", "PICKING_HELPER_TEAMS_WEBHOOK_URL", ""),  # NEW
+        "teams_webhook_url": get("teams_webhook_url", "PICKING_HELPER_TEAMS_WEBHOOK_URL", ""),
         "notify_to": get("notify_to", "PICKING_HELPER_NOTIFY_TO", ""),
         "lookup_file": get("lookup_file", "PICKING_HELPER_LOOKUP_FILE", ""),
         "log_dir": get("log_dir", "PICKING_HELPER_LOG_DIR", "logs"),
@@ -37,6 +36,8 @@ def _get_cfg():
         "require_staging": str(get("require_staging", "PICKING_HELPER_REQUIRE_STAGING", "0")).strip().lower() in ("1","true","yes"),
         "scan_to_add": str(get("scan_to_add", "PICKING_HELPER_SCAN_TO_ADD", "1")).strip().lower() in ("1","true","yes"),
         "keep_staging_after_add": str(get("keep_staging_after_add", "PICKING_HELPER_KEEP_STAGING_AFTER_ADD", "1")).strip().lower() in ("1","true","yes"),
+        # NEW: explicit timezone (IANA). Default to America/Chicago for Central Time.
+        "timezone": get("timezone", "PICKING_HELPER_TIMEZONE", "America/Chicago"),
     }
     nt = cfg["notify_to"]
     if isinstance(nt, list):
@@ -56,8 +57,39 @@ def _get_cfg():
 
 CFG = _get_cfg()
 
+# -------------------- TIMEZONE HELPERS (NEW) --------------------
+def get_tz():
+    """Return ZoneInfo for configured timezone; fall back to None if invalid."""
+    tzname = (CFG.get("timezone") or "America/Chicago").strip()
+    try:
+        from zoneinfo import ZoneInfo  # py>=3.9
+        return ZoneInfo(tzname)
+    except Exception:
+        return None
+
+def now_local():
+    """Timezone-aware 'now' using configured time zone; falls back to system local naive."""
+    tz = get_tz()
+    return datetime.now(tz) if tz else datetime.now()
+
+def ts12(dt: Optional[datetime] = None) -> str:
+    """Return 12‑hour local timestamp like '2025-10-17 09:14:05 AM' honoring configured timezone."""
+    if dt is None:
+        dt = now_local()
+    else:
+        try:
+            tz = get_tz()
+            if tz:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=tz)
+                else:
+                    dt = dt.astimezone(tz)
+        except Exception:
+            pass
+    return dt.strftime("%Y-%m-%d %I:%M:%S %p")
+
 # -------------------- ENV / PATHS --------------------
-TODAY = datetime.now().strftime("%Y-%m-%d")
+TODAY = now_local().strftime("%Y-%m-%d")              # local date for file naming
 LOG_DIR = CFG["log_dir"] or "logs"
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"picking-log-{TODAY}.csv")
@@ -79,8 +111,8 @@ defaults = {
     "scan": "",
     "staging_scan": "",
     "typed_staging": "",
-    "qty_picked_str": "",          # text input so it starts blank
-    "qty_staged": 0,               # internal numeric mirror
+    "qty_picked_str": "",
+    "qty_staged": 0,
     "starting_qty": None,
     "picked_so_far": {},
     "recent_scans": [],
@@ -91,10 +123,10 @@ defaults = {
     "batch_rows": [],
     "undo_stack": [],
     "redo_stack": [],
-    "start_qty_by_pallet": {},     # pallet_id -> int
-    "pallet_qty": None,            # KPI value for current pallet
-    "clear_qty_next": False,       # safe clear for QTY input
-    "clear_top_next": False,       # safe clear top pallet/fields before UI draw
+    "start_qty_by_pallet": {},
+    "pallet_qty": None,
+    "clear_qty_next": False,
+    "clear_top_next": False,
 }
 for k, v in defaults.items():
     if k not in ss:
@@ -105,7 +137,7 @@ def clean_scan(raw: str) -> str:
     return (raw or "").replace("\r", "").replace("\n", "").strip()
 
 def strip_aim_prefix(s: str) -> str:
-    # Correctly remove patterns like "]C1", "]A0", etc.
+    # Remove AIM symbology prefix like "]C1", "]A0", etc.
     m = re.match(r"^\][A-Za-z]\d", s)
     return s[m.end():] if m else s
 
@@ -124,11 +156,6 @@ def safe_int(x, default=0) -> int:
 def clamp_nonneg(n: Optional[int]) -> Optional[int]:
     if n is None: return None
     return max(int(n), 0)
-
-# 12-hour timestamp helper
-def ts12(dt: Optional[datetime] = None) -> str:
-    """Return local 12-hour timestamp like '2025-10-17 09:14:05 AM'."""
-    return (dt or datetime.now()).strftime("%Y-%m-%d %I:%M:%S %p")
 
 def append_log_row(row: dict):
     file_exists = os.path.isfile(LOG_FILE)
@@ -183,13 +210,13 @@ def _auto_guess_cols(columns: List[str]) -> Dict[str, Optional[str]]:
                 return c
         return None
     return {
-        "pallet":   pick(["pallet","pallet id","pallet_id","lpn","license","serial","sscc"]),
-        "sku":      pick(["sku","item","itemcode","product","part","material"]),
+        "pallet": pick(["pallet","pallet id","pallet_id","lpn","license","serial","sscc"]),
+        "sku": pick(["sku","item","itemcode","product","part","material"]),
         # Default LOT -> CustomerLotReference (plus aliases)
-        "lot":      pick(["customerlotreference","customer lot reference","lot","lot_number","lot #","lot#","batch","batchno"]),
+        "lot": pick(["customerlotreference","customer lot reference","lot","lot_number","lot #","lot#","batch","batchno"]),
         "location": pick(["location","loc","bin","slot","binlocation","location code","staging","stg"]),
         # Default QTY -> QTYOnHand (plus aliases)
-        "qty":      pick(["qtyonhand","qty","quantity","cases","casecount","count","units","pallet_qty","onhand","on_hand"]),
+        "qty": pick(["qtyonhand","qty","quantity","cases","casecount","count","units","pallet_qty","onhand","on_hand"]),
     }
 
 @st.cache_data(show_spinner=False)
@@ -254,11 +281,8 @@ def lookup_fields_by_pallet(df, colmap: Dict[str, Optional[str]], pallet_id: str
 
 # -------------------- SCAN PARSERS --------------------
 def try_parse_json(s: str) -> Optional[Dict[str,str]]:
-    try:
-        obj = json.loads(s)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
+    try: obj = json.loads(s); return obj if isinstance(obj, dict) else None
+    except Exception: return None
 
 def try_parse_query_or_kv(s: str) -> Optional[Dict[str,str]]:
     if "://" in s:
@@ -284,12 +308,11 @@ def try_parse_label_kv(s: str) -> Optional[Dict[str,str]]:
         if ":" in line:
             k, v = line.split(":", 1)
             k = k.strip().lower(); v = v.strip()
-            if k and v:
-                out[k] = v
+            if k and v: out[k] = v
     return out or None
 
 def try_parse_label_compact(s: str) -> Optional[Dict[str,str]]:
-    tokens = re.split(r"[,\\s;]+", s.strip())
+    tokens = re.split(r"[,\\\s;]+", s.strip())
     out = {}
     i = 0
     while i < len(tokens) - 1:
@@ -303,7 +326,7 @@ def try_parse_label_compact(s: str) -> Optional[Dict[str,str]]:
     return out or None
 
 def try_parse_gs1_paren(s: str) -> Optional[Dict[str,str]]:
-    pairs = re.findall(r"\((\d{2,4})\)([^\(\)]+)", s)
+    pairs = re.findall(r"\((\d{2,4})\)([^()]+)", s)
     if not pairs:
         return None
     out: Dict[str,str] = {}
@@ -376,9 +399,9 @@ def try_parse_gs1_numeric_naked(s: str) -> Optional[Dict[str,str]]:
 def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
     key_map = {
         "location": ["location","loc","bin","slot","staging","stg","binlocation","location code"],
-        "pallet":   ["pallet","pallet_id","pallet id","serial","id","license","lpn","sscc"],
-        "sku":      ["sku","item","itemcode","product","part","material"],
-        "lot":      ["customerlotreference","customer lot reference","lot","lot_number","lot #","lot#","batch","batchno"],
+        "pallet": ["pallet","pallet_id","pallet id","serial","id","license","lpn","sscc"],
+        "sku": ["sku","item","itemcode","product","part","material"],
+        "lot": ["customerlotreference","customer lot reference","lot","lot_number","lot #","lot#","batch","batchno"],
     }
     out: Dict[str,str] = {}
     lower_data = {k.lower(): str(v) for k, v in data.items()}
@@ -414,11 +437,17 @@ def parse_any_scan(raw_code: str) -> Dict[str,str]:
 
 # -------------------- SIDEBAR --------------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.6.5 (12‑hour timestamps • Teams webhook optional • auto-clear)", icon="🧭")
+    st.info("BUILD: outbound-batch v1.7.0 (TZ-aware • 12‑hour timestamps • Teams webhook • auto‑clear)", icon="🧭")
     st.caption(f"Config source: **{CFG['_source']}**")
 
     st.markdown("### ⚙️ Settings")
     ss["operator"] = st.text_input("Picker Name (required)", value=ss.operator, placeholder="e.g., Carlos")
+    # Timezone control (NEW)
+    CFG["timezone"] = st.text_input(
+        "Timezone (IANA)", value=CFG.get("timezone") or "America/Chicago",
+        help="Examples: America/Chicago • America/Denver • UTC • America/New_York"
+    )
+    st.caption(f"Current app time: {ts12()}  (TZ: {CFG['timezone'] or 'system'})")
 
     st.write("**Log file:**", f"`{LOG_FILE}`")
     st.caption(f"Recipients (email): {', '.join(NOTIFY_TO)}")
@@ -432,10 +461,9 @@ with st.sidebar:
         st.info("Optional: add `teams_webhook_url` (or env PICKING_HELPER_TEAMS_WEBHOOK_URL) to notify a Teams channel.")
 
     st.markdown("---")
-    st.markdown("#### Inventory Lookup (manual)")
+    st.markdown("#### #### Inventory Lookup (manual)")
     st.caption("Upload your latest RAMP export (CSV/XLS/XLSX). Scans will auto-fill from this file + barcode contents.")
     uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv","xlsx","xls"], accept_multiple_files=False)
-
     cols_btn = st.columns([1,1])
     with cols_btn[0]:
         if st.button("↻ Clear lookup cache", use_container_width=True):
@@ -447,7 +475,6 @@ with st.sidebar:
             st.rerun()
     with cols_btn[1]:
         pass
-
     up_bytes = uploaded.read() if uploaded is not None else None
     df, guessed = None, None
     lookup_error = None
@@ -462,7 +489,6 @@ with st.sidebar:
     if ss.lookup_df is not None:
         st.success(f"Loaded lookup with {len(ss.lookup_df):,} rows")
         cols = list(ss.lookup_df.columns)
-
         desired_defaults = {
             "pallet": "PalletID",
             "lot": "CustomerLotReference",
@@ -474,21 +500,19 @@ with st.sidebar:
         for key, want in desired_defaults.items():
             if want and want in cols:
                 g[key] = want
-
         qty_candidates = ["QTYOnHand", "QTY On Hand", "OnHandQty", "On Hand", "On_Hand"]
         for qn in qty_candidates:
             if qn in cols:
                 g["qty"] = qn
                 break
-
         c1, c2 = st.columns(2)
         with c1:
             ss.lookup_cols["pallet"] = st.selectbox("Pallet column", options=cols, index=cols.index(g.get("pallet")) if g.get("pallet") in cols else 0)
-            ss.lookup_cols["sku"]    = st.selectbox("SKU column", options=["(none)"] + cols, index=(cols.index(g.get("sku")) + 1) if g.get("sku") in cols else 0)
+            ss.lookup_cols["sku"] = st.selectbox("SKU column", options=["(none)"] + cols, index=(cols.index(g.get("sku")) + 1) if g.get("sku") in cols else 0)
         with c2:
-            ss.lookup_cols["lot"]      = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g.get("lot")) + 1) if g.get("lot") in cols else 0)
+            ss.lookup_cols["lot"] = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g.get("lot")) + 1) if g.get("lot") in cols else 0)
             ss.lookup_cols["location"] = st.selectbox("Location column", options=["(none)"] + cols, index=(cols.index(g.get("location")) + 1) if g.get("location") in cols else 0)
-            ss.lookup_cols["qty"]      = st.selectbox("Pallet QTY column", options=["(none)"] + cols, index=(cols.index(g.get("qty")) + 1) if g.get("qty") in cols else 0)
+            ss.lookup_cols["qty"] = st.selectbox("Pallet QTY column", options=["(none)"] + cols, index=(cols.index(g.get("qty")) + 1) if g.get("qty") in cols else 0)
         for k in ["sku","lot","location","qty"]:
             if ss.lookup_cols.get(k) == "(none)":
                 ss.lookup_cols[k] = None
@@ -496,21 +520,24 @@ with st.sidebar:
         st.warning("No Inventory Lookup loaded — auto-fill is limited to what the barcode encodes (e.g., LPN via GS1 21/240, LOT via 10).", icon="ℹ️")
 
     st.markdown("---")
-    st.markdown("#### Behavior")
+    st.markdown("#### #### Behavior")
     CFG["require_location"] = st.toggle("Require Location on Add", value=CFG["require_location"])
-    CFG["require_staging"]  = st.toggle("Require Staging on Add",  value=CFG["require_staging"])
-    CFG["scan_to_add"]      = st.toggle("Scan-to-Add (after QTY, staging scan auto-adds)", value=CFG["scan_to_add"])
+    CFG["require_staging"] = st.toggle("Require Staging on Add", value=CFG["require_staging"])
+    CFG["scan_to_add"] = st.toggle("Scan-to-Add (after QTY, staging scan auto-adds)", value=CFG["scan_to_add"])
     CFG["keep_staging_after_add"] = st.toggle("Keep Staging Location after Add", value=CFG["keep_staging_after_add"])
+
     st.markdown("---")
-    st.markdown("#### Start/Balance (optional)")
+    st.markdown("#### #### Start/Balance (optional)")
     ss["starting_qty"] = st.number_input(
         "Starting qty on current pallet (fallback if lookup lacks qty)",
         min_value=0, step=1, value=ss.starting_qty or 0,
         help="If your lookup provides pallet quantity, that value will override this for KPI & Remaining."
     )
     st.caption("Max picked per line remains 15 cases (validation).")
+
     if KIOSK:
         st.caption("KIOSK MODE enabled (menu/footer hidden).")
+
     with st.expander("Diagnostics", expanded=False):
         st.write({
             "python": sys.version.split()[0],
@@ -518,6 +545,8 @@ with st.sidebar:
             "streamlit": st.__version__,
             "LOOKUP_FILE": LOOKUP_FILE_ENV or "(empty)",
             "cfg_source": CFG["_source"],
+            "timezone": CFG.get("timezone"),
+            "now_local": ts12(),
             "cwd": os.getcwd(),
             "files_in_cwd": sorted(os.listdir("."))[:50],
         })
@@ -563,11 +592,9 @@ if ss.clear_top_next:
     ss.scan = ""  # pallet scan box
     if not CFG["keep_staging_after_add"]:
         ss.staging_location_current = ""
-
 if ss.clear_qty_next:
     ss.clear_qty_next = False
     st.session_state["qty_picked_str"] = ""
-
 _focus_first_text()
 
 # -------------------- Pallet + Staging --------------------
@@ -615,7 +642,7 @@ def on_pallet_scan():
     if ss.sku: bits.append(f"SKU {ss.sku}")
     if ss.lot_number: bits.append(f"LOT {ss.lot_number}")
     st.toast("\n".join(bits), icon="✅")
-    ss.recent_scans.insert(0, (datetime.now().strftime("%I:%M:%S %p"), strip_aim_prefix(code)))  # 12-hour
+    ss.recent_scans.insert(0, (now_local().strftime("%I:%M:%S %p"), strip_aim_prefix(code)))  # 12‑hour
     ss.recent_scans = ss.recent_scans[:25]
     ss.scan = ""
     ss.focus_qty = True
@@ -680,6 +707,7 @@ with c6: st.metric("Pallet QTY", "—" if ss.pallet_qty is None else safe_int(ss
 with c7:
     rem = get_remaining_for_pallet(ss.current_pallet) if ss.current_pallet else None
     st.metric("Remaining", "—" if rem is None else rem)
+
 with st.expander("Recent scans", expanded=False):
     if ss.recent_scans:
         for t, c in ss.recent_scans[:10]:
@@ -698,7 +726,6 @@ qty_str = st.text_input(
     help="Type the quantity picked for this line (max 15)."
 )
 ss.qty_staged = safe_int(qty_str, 0)
-
 if ss.focus_qty:
     _focus_qty_input()
     ss.focus_qty = False
@@ -748,8 +775,8 @@ def _add_current_line_to_batch():
         "pallet_id": ss.current_pallet,
         "sku": ss.sku or "",
         "lot_number": ss.lot_number or "",
-        "qty_staged": int(q),  # keep internal field name for compatibility
-        "timestamp": ts12(),   # 12-hour
+        "qty_staged": int(q),
+        "timestamp": ts12(),  # 12-hour local
     }
     ss.batch_rows.append(line)
     ss.undo_stack.append(("add", line))
@@ -758,8 +785,8 @@ def _add_current_line_to_batch():
         + (f" → {line['staging_location']}" if line['staging_location'] else "")
     )
     # Request safe clears on the next run
-    ss.clear_qty_next = True     # clears QTY Picked widget
-    ss.clear_top_next = True     # clears top pallet fields (and staging if toggle is off)
+    ss.clear_qty_next = True   # clears QTY Picked widget
+    ss.clear_top_next = True   # clears top pallet fields (and staging if toggle is off)
     ss.qty_staged = 0
     st.rerun()
     return True
@@ -817,7 +844,7 @@ else:
             "lot_number",
             "qty_staged",
             "remaining_qty",
-            "timestamp",  # already 12-hour when created
+            "timestamp",  # already 12-hour local when created
         ]
         df_view = df[view_cols].copy()
         op_col1, op_col2 = st.columns([1,3])
@@ -868,7 +895,7 @@ else:
                     "sku": str(r.get("sku","")),
                     "lot_number": normalize_lot(str(r.get("lot_number",""))),
                     "qty_staged": qty,
-                    "timestamp": str(r.get("timestamp","")),  # already 12-hour
+                    "timestamp": str(r.get("timestamp","")),  # already 12-hour local
                 })
             ss.picked_so_far = {}
             for row in new_rows:
@@ -893,8 +920,10 @@ else:
                 if bad:
                     st.error("Some lines are invalid (missing required fields or qty not in 1–15). Fix and try again.")
                 else:
-                    batch_id = f"BATCH-{datetime.now().isoformat(timespec='seconds')}-{(ss.operator or 'operator')}".replace(":", "")
-                    submitted_at_iso = datetime.now().isoformat(timespec="seconds")  # keep ISO for systems
+                    # Use local, tz-aware time for IDs and ISO
+                    dt_now = now_local()
+                    batch_id = f"BATCH-{dt_now.isoformat(timespec='seconds')}-{(ss.operator or 'operator')}".replace(":", "")
+                    submitted_at_iso = dt_now.isoformat(timespec="seconds")
                     totals_qty = sum(safe_int(r["qty_staged"],0) for r in ss.batch_rows)
                     payload = {
                         "batch_id": batch_id,
@@ -930,14 +959,14 @@ else:
                             requests.post(TEAMS_WEBHOOK_URL, json=card, timeout=10)
                         except Exception:
                             pass
-                    # Write CSV log rows (12-hour timestamps)
+                    # Write CSV log rows (12-hour local timestamps)
                     for r in ss.batch_rows:
                         pal = r.get("pallet_id","")
                         start_qty = get_start_qty(pal)
                         current_picked = safe_int(ss.picked_so_far.get(pal, 0), 0)
                         remaining_after = clamp_nonneg((start_qty - current_picked) if start_qty is not None else None)
                         append_log_row({
-                            "timestamp": ts12(),  # 12-hour
+                            "timestamp": ts12(),  # 12-hour local
                             "operator": ss.operator or "",
                             "order_number": "",  # keep schema, blank value
                             "location": r.get("source_location",""),
