@@ -1,5 +1,7 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.7.1 — TZ-aware + Remaining-cap enforcement (no picking past 0) + Teams webhook + preserves AIM/LOT/QTY defaults & auto-clear
+# v1.8 — Persistent Lookup (mobile-safe) + Saved Column Mapping + Mobile UI tweaks
+# v1.7.1 — TZ-aware + Remaining-cap enforcement + Teams webhook + preserves AIM/LOT/QTY defaults & auto-clear
+
 import os
 import io
 import re
@@ -12,10 +14,32 @@ from typing import Optional, Dict, List, Tuple
 from urllib.parse import urlparse, parse_qs, unquote_plus
 from datetime import datetime
 from pathlib import Path
+
 import streamlit as st
 
 # -------------------- PAGE SETUP --------------------
 st.set_page_config(page_title="Picking Helper", page_icon="📦", layout="wide")
+
+# --- Mobile-friendly CSS (larger touch targets + compact padding on phones)
+st.markdown("""
+<style>
+/* Bigger buttons */
+.stButton > button, .stDownloadButton > button {
+    min-height: 48px;
+    font-size: 1.05rem;
+}
+/* Inputs a bit larger for touch */
+div[data-baseweb="input"] input, .stNumberInput input, .stTextInput input {
+    min-height: 44px;
+    font-size: 1.02rem;
+}
+/* Compact padding on narrow screens */
+@media (max-width: 640px) {
+  .block-container { padding-top: 0.6rem; padding-left: 0.5rem; padding-right: 0.5rem; }
+  h1, h2, h3 { line-height: 1.2; }
+}
+</style>
+""", unsafe_allow_html=True)
 
 # -------------------- CONFIG (Secrets-first, env fallback) --------------------
 def _get_cfg():
@@ -43,7 +67,7 @@ def _get_cfg():
     if isinstance(nt, list):
         notify = nt
     else:
-        parts = re.split(r"[;,]", nt) if nt else []
+        parts = re.split(r"[,;]", nt) if nt else []
         notify = [p.strip() for p in parts if p.strip()]
     if not notify:
         notify = [
@@ -54,7 +78,6 @@ def _get_cfg():
     cfg["notify_to"] = notify
     cfg["_source"] = "Secrets" if isinstance(sec, dict) and sec else "Env"
     return cfg
-
 CFG = _get_cfg()
 
 # -------------------- TIMEZONE HELPERS --------------------
@@ -65,11 +88,9 @@ def get_tz():
         return ZoneInfo(tzname)
     except Exception:
         return None
-
 def now_local():
     tz = get_tz()
     return datetime.now(tz) if tz else datetime.now()
-
 def ts12(dt: Optional[datetime] = None) -> str:
     if dt is None:
         dt = now_local()
@@ -86,7 +107,7 @@ def ts12(dt: Optional[datetime] = None) -> str:
     return dt.strftime("%Y-%m-%d %I:%M:%S %p")
 
 # -------------------- ENV / PATHS --------------------
-TODAY = now_local().strftime("%Y-%m-%d")              # local date for file naming
+TODAY = now_local().strftime("%Y-%m-%d")  # local date for file naming
 LOG_DIR = CFG["log_dir"] or "logs"
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"picking-log-{TODAY}.csv")
@@ -95,6 +116,54 @@ TEAMS_WEBHOOK_URL = (CFG["teams_webhook_url"] or "").strip()
 NOTIFY_TO: List[str] = CFG["notify_to"]
 LOOKUP_FILE_ENV = (CFG["lookup_file"] or "").strip()
 KIOSK = CFG["kiosk"]
+
+# -- Persistent Lookup Paths
+PERSIST_DIR = os.path.join(LOG_DIR, "lookup")
+Path(PERSIST_DIR).mkdir(parents=True, exist_ok=True)
+META_PATH = os.path.join(PERSIST_DIR, "lookup_meta.json")
+
+def _read_lookup_meta() -> Dict:
+    try:
+        with open(META_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _write_lookup_meta(meta: Dict):
+    try:
+        with open(META_PATH, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _persist_uploaded_lookup(filename: str, raw_bytes: bytes) -> str:
+    # Save to logs/lookup/lookup-latest.<ext>
+    ext = ""
+    if "." in filename:
+        ext = "." + filename.split(".")[-1].lower().strip()
+    if ext not in [".csv", ".xlsx", ".xls"]:
+        # default to .csv if unknown
+        ext = ".csv"
+    save_path = os.path.join(PERSIST_DIR, f"lookup-latest{ext}")
+    with open(save_path, "wb") as f:
+        f.write(raw_bytes)
+    meta = _read_lookup_meta()
+    meta.update({
+        "saved_path": save_path,
+        "original_name": filename,
+        "uploaded_at": ts12(),
+        "size_bytes": len(raw_bytes),
+    })
+    _write_lookup_meta(meta)
+    return save_path
+
+def _get_persisted_lookup_path() -> Optional[str]:
+    # Priority: Secrets/Env (LOOKUP_FILE_ENV) > meta.saved_path (if exists)
+    if LOOKUP_FILE_ENV and os.path.exists(LOOKUP_FILE_ENV):
+        return LOOKUP_FILE_ENV
+    meta = _read_lookup_meta()
+    p = meta.get("saved_path")
+    return p if p and os.path.exists(p) else None
 
 # -------------------- SESSION STATE --------------------
 ss = st.session_state
@@ -132,11 +201,9 @@ for k, v in defaults.items():
 # -------------------- HELPERS --------------------
 def clean_scan(raw: str) -> str:
     return (raw or "").replace("\r", "").replace("\n", "").strip()
-
 def strip_aim_prefix(s: str) -> str:
     m = re.match(r"^\][A-Za-z]\d", s)
     return s[m.end():] if m else s
-
 def safe_int(x, default=0) -> int:
     try:
         if x is None: return default
@@ -148,11 +215,9 @@ def safe_int(x, default=0) -> int:
         return int(s2) if s2 not in ("","-") else default
     except Exception:
         return default
-
 def clamp_nonneg(n: Optional[int]) -> Optional[int]:
     if n is None: return None
     return max(int(n), 0)
-
 def append_log_row(row: dict):
     file_exists = os.path.isfile(LOG_FILE)
     field_order = [
@@ -167,10 +232,8 @@ def append_log_row(row: dict):
         if not file_exists:
             writer.writeheader()
         writer.writerow({k: row.get(k, "") for k in field_order})
-
 def upsert_picked(pallet_id: str, qty: int):
     ss.picked_so_far[pallet_id] = ss.picked_so_far.get(pallet_id, 0) + max(safe_int(qty,0),0)
-
 def get_start_qty(pallet_id: str) -> Optional[int]:
     if not pallet_id:
         return None
@@ -179,14 +242,12 @@ def get_start_qty(pallet_id: str) -> Optional[int]:
     if pallet_id == ss.current_pallet and ss.starting_qty not in (None, 0):
         return safe_int(ss.starting_qty, 0)
     return None
-
 def get_remaining_for_pallet(pallet_id: str) -> Optional[int]:
     start = get_start_qty(pallet_id)
     if start is None:
         return None
     picked = safe_int(ss.picked_so_far.get(pallet_id, 0), 0)
     return clamp_nonneg(start - picked)
-
 def normalize_lot(lot: Optional[str]) -> str:
     if not lot:
         return ""
@@ -277,7 +338,6 @@ def lookup_fields_by_pallet(df, colmap: Dict[str, Optional[str]], pallet_id: str
 def try_parse_json(s: str) -> Optional[Dict[str,str]]:
     try: obj = json.loads(s); return obj if isinstance(obj, dict) else None
     except Exception: return None
-
 def try_parse_query_or_kv(s: str) -> Optional[Dict[str,str]]:
     if "://" in s:
         parsed = urlparse(s)
@@ -294,7 +354,6 @@ def try_parse_query_or_kv(s: str) -> Optional[Dict[str,str]]:
             k, v = p.split(":", 1)
             kv[k.strip().lower()] = v.strip()
     return kv or None
-
 def try_parse_label_kv(s: str) -> Optional[Dict[str,str]]:
     lines = re.split(r"[\n;,]+", s)
     out = {}
@@ -304,7 +363,6 @@ def try_parse_label_kv(s: str) -> Optional[Dict[str,str]]:
             k = k.strip().lower(); v = v.strip()
             if k and v: out[k] = v
     return out or None
-
 def try_parse_label_compact(s: str) -> Optional[Dict[str,str]]:
     tokens = re.split(r"[,\\\s;]+", s.strip())
     out = {}
@@ -318,7 +376,6 @@ def try_parse_label_compact(s: str) -> Optional[Dict[str,str]]:
         else:
             i += 1
     return out or None
-
 def try_parse_gs1_paren(s: str) -> Optional[Dict[str,str]]:
     pairs = re.findall(r"\((\d{2,4})\)([^()]+)", s)
     if not pairs:
@@ -332,7 +389,6 @@ def try_parse_gs1_paren(s: str) -> Optional[Dict[str,str]]:
         elif ai == "00": out["pallet"] = val
         elif ai in {"240","241"}: out["pallet"] = val
     return out or None
-
 def try_parse_gs1_fnc1(s: str) -> Optional[Dict[str,str]]:
     GS = "\x1D"
     if GS not in s and not re.match(r"^\d{2,4}", s):
@@ -372,7 +428,6 @@ def try_parse_gs1_fnc1(s: str) -> Optional[Dict[str,str]]:
         elif ai == "01":
             out["gtin"] = val
     return out or None
-
 def try_parse_gs1_numeric_naked(s: str) -> Optional[Dict[str,str]]:
     if not re.match(r"^\d{2,4}", s):
         return None
@@ -389,7 +444,6 @@ def try_parse_gs1_numeric_naked(s: str) -> Optional[Dict[str,str]]:
         val = s[3:]
         if val: out["pallet"] = val
     return out or None
-
 def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
     key_map = {
         "location": ["location","loc","bin","slot","staging","stg","binlocation","location code"],
@@ -407,7 +461,6 @@ def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
     if "lot" in out:
         out["lot"] = normalize_lot(out["lot"])
     return out
-
 def parse_any_scan(raw_code: str) -> Dict[str,str]:
     code = strip_aim_prefix(raw_code)
     for fn in (
@@ -431,7 +484,7 @@ def parse_any_scan(raw_code: str) -> Dict[str,str]:
 
 # -------------------- SIDEBAR --------------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.7.1 (TZ-aware • Remaining-cap • 12‑hour timestamps • Teams webhook • auto‑clear)", icon="🧭")
+    st.info("BUILD: outbound-batch v1.8 (Persistent Lookup • Saved Mapping • Mobile UI)", icon="🧭")
     st.caption(f"Config source: **{CFG['_source']}**")
 
     st.markdown("### ⚙️ Settings")
@@ -440,8 +493,7 @@ with st.sidebar:
         "Timezone (IANA)", value=CFG.get("timezone") or "America/Chicago",
         help="Examples: America/Chicago • America/Denver • UTC • America/New_York"
     )
-    st.caption(f"Current app time: {ts12()}  (TZ: {CFG['timezone'] or 'system'})")
-
+    st.caption(f"Current app time: {ts12()} (TZ: {CFG['timezone'] or 'system'})")
     st.write("**Log file:**", f"`{LOG_FILE}`")
     st.caption(f"Recipients (email): {', '.join(NOTIFY_TO)}")
     if WEBHOOK_URL:
@@ -454,34 +506,80 @@ with st.sidebar:
         st.info("Optional: add `teams_webhook_url` (or env PICKING_HELPER_TEAMS_WEBHOOK_URL) to notify a Teams channel.")
 
     st.markdown("---")
-    st.markdown("#### #### Inventory Lookup (manual)")
+    st.markdown("#### #### Inventory Lookup")
     st.caption("Upload your latest RAMP export (CSV/XLS/XLSX). Scans will auto-fill from this file + barcode contents.")
+
+    # Figure out persisted path if any (unless explicit Secrets/Env path is set)
+    persisted_path = _get_persisted_lookup_path()
+    current_source_note = None
+    if LOOKUP_FILE_ENV and os.path.exists(LOOKUP_FILE_ENV):
+        current_source_note = f"Using Secrets/Env file: `{LOOKUP_FILE_ENV}`"
+    elif persisted_path:
+        current_source_note = f"Using saved lookup: `{persisted_path}`"
+    else:
+        current_source_note = "No saved lookup yet."
+
     uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv","xlsx","xls"], accept_multiple_files=False)
-    cols_btn = st.columns([1,1])
+
+    cols_btn = st.columns([1,1,1])
     with cols_btn[0]:
         if st.button("↻ Clear lookup cache", use_container_width=True):
             try:
                 load_lookup.clear()
             except Exception:
                 pass
-            st.toast("Lookup cache cleared — re-upload or rely on Secrets path.", icon="🧹")
+            st.toast("Lookup cache cleared — re-upload or rely on Secrets/saved file.", icon="🧹")
             st.rerun()
     with cols_btn[1]:
-        pass
+        # Remove persisted file + meta
+        if st.button("🧹 Remove saved lookup file", use_container_width=True, disabled=not persisted_path):
+            try:
+                if persisted_path and os.path.exists(persisted_path):
+                    os.remove(persisted_path)
+            except Exception:
+                pass
+            try:
+                if os.path.exists(META_PATH):
+                    os.remove(META_PATH)
+            except Exception:
+                pass
+            st.toast("Saved lookup file + metadata removed.", icon="🗑️")
+            st.rerun()
+    with cols_btn[2]:
+        st.caption(current_source_note or "")
+
+    # Read uploaded file (if any) and also persist it to disk for future sessions
+    up_name = uploaded.name if uploaded is not None else None
     up_bytes = uploaded.read() if uploaded is not None else None
+
+    # Decide which path to load from
+    load_path = LOOKUP_FILE_ENV or (None if up_bytes else persisted_path)  # if uploading now, pass bytes
+
     df, guessed = None, None
     lookup_error = None
     try:
-        df, guessed = load_lookup(LOOKUP_FILE_ENV if not up_bytes else None, up_bytes)
+        df, guessed = load_lookup(load_path, up_bytes)
         ss.lookup_df = df
+        # If this was a new upload and it parsed OK, persist it for next time
+        if up_bytes and up_name and df is not None and len(df) > 0:
+            saved_path = _persist_uploaded_lookup(up_name, up_bytes)
+            st.toast(f"Saved lookup for future sessions: {saved_path}", icon="💾")
     except Exception as e:
         lookup_error = str(e)
         ss.lookup_df = None
+
     if lookup_error:
         st.error(f"Lookup load error: {lookup_error}")
+
+    # Column mapping UI + defaults (from desired, guessed, and saved meta)
+    saved_meta = _read_lookup_meta()
+    saved_colmap = saved_meta.get("colmap") if isinstance(saved_meta.get("colmap"), dict) else {}
+
     if ss.lookup_df is not None:
         st.success(f"Loaded lookup with {len(ss.lookup_df):,} rows")
         cols = list(ss.lookup_df.columns)
+
+        # desire known defaults first
         desired_defaults = {
             "pallet": "PalletID",
             "lot": "CustomerLotReference",
@@ -490,14 +588,22 @@ with st.sidebar:
             "qty": None,
         }
         g = guessed or {"pallet": None, "sku": None, "lot": None, "location": None, "qty": None}
+
+        # prefer saved mapping if columns exist
+        for k, v in (saved_colmap or {}).items():
+            if v and v in cols:
+                g[k] = v
+
+        # then well-known defaults if present
         for key, want in desired_defaults.items():
             if want and want in cols:
                 g[key] = want
         qty_candidates = ["QTYOnHand", "QTY On Hand", "OnHandQty", "On Hand", "On_Hand"]
         for qn in qty_candidates:
+            if g.get("qty"): break
             if qn in cols:
                 g["qty"] = qn
-                break
+
         c1, c2 = st.columns(2)
         with c1:
             ss.lookup_cols["pallet"] = st.selectbox("Pallet column", options=cols, index=cols.index(g.get("pallet")) if g.get("pallet") in cols else 0)
@@ -506,9 +612,17 @@ with st.sidebar:
             ss.lookup_cols["lot"] = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g.get("lot")) + 1) if g.get("lot") in cols else 0)
             ss.lookup_cols["location"] = st.selectbox("Location column", options=["(none)"] + cols, index=(cols.index(g.get("location")) + 1) if g.get("location") in cols else 0)
             ss.lookup_cols["qty"] = st.selectbox("Pallet QTY column", options=["(none)"] + cols, index=(cols.index(g.get("qty")) + 1) if g.get("qty") in cols else 0)
+
         for k in ["sku","lot","location","qty"]:
             if ss.lookup_cols.get(k) == "(none)":
                 ss.lookup_cols[k] = None
+
+        # Save mapping button
+        if st.button("💾 Save mapping as default", use_container_width=True):
+            meta = _read_lookup_meta()
+            meta["colmap"] = ss.lookup_cols
+            _write_lookup_meta(meta)
+            st.toast("Default mapping saved. It will auto-apply next time.", icon="✅")
     else:
         st.warning("No Inventory Lookup loaded — auto-fill is limited to what the barcode encodes (e.g., LPN via GS1 21/240, LOT via 10).", icon="ℹ️")
 
@@ -527,7 +641,6 @@ with st.sidebar:
         help="If your lookup provides pallet quantity, that value will override this for KPI & Remaining."
     )
     st.caption("Max picked per line remains 15 cases (validation).")
-
     if KIOSK:
         st.caption("KIOSK MODE enabled (menu/footer hidden).")
 
@@ -536,7 +649,8 @@ with st.sidebar:
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "streamlit": st.__version__,
-            "LOOKUP_FILE": LOOKUP_FILE_ENV or "(empty)",
+            "LOOKUP_FILE (Secrets/Env)": LOOKUP_FILE_ENV or "(empty)",
+            "persisted_lookup": _get_persisted_lookup_path() or "(none)",
             "cfg_source": CFG["_source"],
             "timezone": CFG.get("timezone"),
             "now_local": ts12(),
@@ -568,7 +682,10 @@ def _focus_qty_input():
     const f = () => {
       const els = Array.from(window.parent.document.querySelectorAll('input[aria-label]'));
       const el = els.find(i => i.getAttribute('aria-label')?.toLowerCase()?.includes('enter qty picked'));
-      if (el) { el.focus(); el.select(); }
+      if (el) {
+        el.setAttribute('inputmode', 'numeric');  // helps mobile show numeric keyboard
+        el.focus(); el.select();
+      }
     };
     setTimeout(f, 150);
     </script>
@@ -664,7 +781,6 @@ st.subheader("Pallet ID")
 st.text_input("Scan pallet here", key="scan",
               placeholder="Scan pallet barcode (GS1/AIM/JSON/query/label parsed)",
               on_change=on_pallet_scan)
-
 with st.expander("🔍 Raw Scan Debugger (last pallet scan)", expanded=False):
     if ss.last_raw_scan:
         raw = ss.last_raw_scan
@@ -704,7 +820,6 @@ with c6: st.metric("Pallet QTY", "—" if ss.pallet_qty is None else safe_int(ss
 with c7:
     rem = get_remaining_for_pallet(ss.current_pallet) if ss.current_pallet else None
     st.metric("Remaining", "—" if rem is None else rem)
-
 with st.expander("Recent scans", expanded=False):
     if ss.recent_scans:
         for t, c in ss.recent_scans[:10]:
@@ -730,7 +845,6 @@ _current_remaining = get_remaining_for_pallet(ss.current_pallet) if _current_sta
 disable_add = (not bool(ss.operator)) or (
     _current_start is not None and _current_remaining is not None and _current_remaining <= 0
 )
-
 if ss.focus_qty:
     _focus_qty_input()
     ss.focus_qty = False
@@ -772,7 +886,6 @@ def _add_current_line_to_batch():
     if CFG["require_staging"] and not ss.staging_location_current:
         st.error("Scan/Type a **Staging Location** before adding.")
         return False
-
     q = safe_int(ss.qty_staged, 0)
     if q <= 0:
         st.error("Enter a **QTY Picked** > 0.")
@@ -780,7 +893,6 @@ def _add_current_line_to_batch():
     if q > 15:
         st.warning("QTY Picked capped at 15 cases per line.")
         q = 15
-
     start_qty = get_start_qty(ss.current_pallet)
     if start_qty is not None:
         remaining_before = get_remaining_for_pallet(ss.current_pallet) or 0
@@ -790,7 +902,6 @@ def _add_current_line_to_batch():
         if q > remaining_before:
             st.warning(f"QTY {q} exceeds Remaining {remaining_before}. Using {remaining_before} instead.")
             q = remaining_before
-
     # Apply
     upsert_picked(ss.current_pallet, q)
     line = {
@@ -817,14 +928,12 @@ def _add_current_line_to_batch():
 
 if add_to_batch_click:
     _add_current_line_to_batch()
-
 if clear_batch and ss.batch_rows:
     for r in ss.batch_rows:
         upsert_picked(r.get("pallet_id",""), -safe_int(r.get("qty_staged"),0))
     ss.undo_stack.append(("remove_all", ss.batch_rows.copy()))
     ss.batch_rows = []
     st.warning("Batch cleared.")
-
 if undo_last:
     if ss.batch_rows:
         last = ss.batch_rows.pop()
