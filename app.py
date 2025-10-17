@@ -1,5 +1,5 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.6.2 — Fix AIM prefix strip; default LOT->CustomerLotReference; QTY->QTYOnHand; expand auto-guess/aliases
+# v1.6.3 — Fix session_state crash when clearing QTY; keep LOT->CustomerLotReference & QTY->QTYOnHand; AIM prefix fix.
 
 import os
 import io
@@ -77,7 +77,7 @@ defaults = {
     "staging_scan": "",
     "typed_staging": "",
     "qty_picked_str": "",          # text input so it starts blank
-    "qty_staged": 0,               # internal numeric
+    "qty_staged": 0,               # internal numeric mirror
     "starting_qty": None,
     "picked_so_far": {},
     "recent_scans": [],
@@ -90,6 +90,7 @@ defaults = {
     "redo_stack": [],
     "start_qty_by_pallet": {},     # pallet_id -> int
     "pallet_qty": None,            # KPI value for current pallet
+    "clear_qty_next": False,       # NEW: safely clear QTY on the next run
 }
 for k, v in defaults.items():
     if k not in ss:
@@ -100,7 +101,7 @@ def clean_scan(raw: str) -> str:
     return (raw or "").replace("\r", "").replace("\n", "").strip()
 
 def strip_aim_prefix(s: str) -> str:
-    # Fix: correctly remove patterns like "]C1", "]A0", etc.
+    # Correctly remove patterns like "]C1", "]A0", etc.
     m = re.match(r"^\][A-Za-z]\d", s)
     return s[m.end():] if m else s
 
@@ -175,10 +176,10 @@ def _auto_guess_cols(columns: List[str]) -> Dict[str, Optional[str]]:
     return {
         "pallet":   pick(["pallet","pallet id","pallet_id","lpn","license","serial","sscc"]),
         "sku":      pick(["sku","item","itemcode","product","part","material"]),
-        # Add CustomerLotReference as a direct synonym (lower-cased)
+        # Default LOT -> CustomerLotReference (plus aliases)
         "lot":      pick(["customerlotreference","customer lot reference","lot","lot_number","lot #","lot#","batch","batchno"]),
         "location": pick(["location","loc","bin","slot","binlocation","location code","staging","stg"]),
-        # Add qtyonhand so QTYOnHand maps automatically
+        # Default QTY -> QTYOnHand (plus aliases)
         "qty":      pick(["qtyonhand","qty","quantity","cases","casecount","count","units","pallet_qty","onhand","on_hand"]),
     }
 
@@ -368,7 +369,6 @@ def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
         "location": ["location","loc","bin","slot","staging","stg","binlocation","location code"],
         "pallet":   ["pallet","pallet_id","pallet id","serial","id","license","lpn","sscc"],
         "sku":      ["sku","item","itemcode","product","part","material"],
-        # Include CustomerLotReference as an alias
         "lot":      ["customerlotreference","customer lot reference","lot","lot_number","lot #","lot#","batch","batchno"],
     }
     out: Dict[str,str] = {}
@@ -405,7 +405,7 @@ def parse_any_scan(raw_code: str) -> Dict[str,str]:
 
 # -------------------- SIDEBAR --------------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.6.2 (LOT->CustomerLotReference • QTY->QTYOnHand • AIM fix)", icon="🧭")
+    st.info("BUILD: outbound-batch v1.6.3 (AIM fix • LOT=CustomerLotReference • QTY=QTYOnHand • safe clear)", icon="🧭")
     st.caption(f"Config source: **{CFG['_source']}**")
 
     st.markdown("### ⚙️ Settings")
@@ -453,10 +453,10 @@ with st.sidebar:
         # Preferred defaults — exact matches if present
         desired_defaults = {
             "pallet": "PalletID",
-            "lot": "CustomerLotReference",    # <-- fixed
+            "lot": "CustomerLotReference",
             "sku": "WarehouseSku",
             "location": "LocationName",
-            "qty": None,  # handled by candidates below
+            "qty": None,  # handled below
         }
         g = guessed or {"pallet": None, "sku": None, "lot": None, "location": None, "qty": None}
         for key, want in desired_defaults.items():
@@ -482,7 +482,7 @@ with st.sidebar:
             if ss.lookup_cols.get(k) == "(none)":
                 ss.lookup_cols[k] = None
     else:
-        st.warning("No Inventory Lookup loaded — auto-fill limited to what your barcode encodes (e.g., LOT via GS1 (10)).", icon="ℹ️")
+        st.warning("No Inventory Lookup loaded — auto-fill is limited to what the barcode encodes (e.g., LPN via GS1 21/240, LOT via 10).", icon="ℹ️")
 
     st.markdown("---")
     st.markdown("#### Behavior")
@@ -542,7 +542,7 @@ def _focus_qty_input():
 
 _focus_first_text()
 
-# -------------------- SCAN HANDLERS --------------------
+# -------------------- Pallet + Staging --------------------
 def _apply_lookup_into_state(pallet_id: str):
     if ss.lookup_df is None:
         if ss.starting_qty and pallet_id:
@@ -567,7 +567,6 @@ def _apply_lookup_into_state(pallet_id: str):
     elif ss.starting_qty and pallet_id:
         ss.pallet_qty = clamp_nonneg(safe_int(ss.starting_qty, 0))
         ss.start_qty_by_pallet[pallet_id] = ss.pallet_qty
-
 def on_pallet_scan():
     raw = ss.scan or ""
     code = clean_scan(raw)
@@ -608,7 +607,6 @@ def set_typed_staging():
     ss.staging_location_current = val
     st.toast(f"Staging Location set: {val}", icon="✍️")
 
-# -------------------- UI: Pallet + Staging --------------------
 st.subheader("Pallet ID")
 st.text_input("Scan pallet here", key="scan",
               placeholder="Scan pallet barcode (GS1/AIM/JSON/query/label parsed)",
@@ -663,6 +661,12 @@ with st.expander("Recent scans", expanded=False):
 st.markdown("---")
 
 # -------------------- QTY Picked + Batch controls --------------------
+# Safely clear the input BEFORE creating the widget (if flagged)
+if ss.clear_qty_next:
+    ss.clear_qty_next = False
+    # Clear underlying widget state on a fresh run
+    st.session_state["qty_picked_str"] = ""
+
 st.subheader("QTY Picked (1–15)")
 qty_str = st.text_input(
     "Enter QTY Picked",
@@ -671,18 +675,6 @@ qty_str = st.text_input(
     help="Type the quantity picked for this line (max 15)."
 )
 ss.qty_staged = safe_int(qty_str, 0)
-
-def _focus_qty_input():
-    st.markdown("""
-    <script>
-    const f = () => {
-      const els = Array.from(window.parent.document.querySelectorAll('input[aria-label]'));
-      const el = els.find(i => i.getAttribute('aria-label')?.toLowerCase()?.includes('enter qty picked'));
-      if (el) { el.focus(); el.select(); }
-    };
-    setTimeout(f, 150);
-    </script>
-    """, unsafe_allow_html=True)
 
 if ss.focus_qty:
     _focus_qty_input()
@@ -742,8 +734,10 @@ def _add_current_line_to_batch():
         f"Added: Pallet {line['pallet_id']} — QTY {line['qty_staged']}"
         + (f" → {line['staging_location']}" if line['staging_location'] else "")
     )
-    ss.qty_picked_str = ""  # keep the field blank after add
+    # Safe clear: flag and rerun; the field is cleared before widget creation
+    ss.clear_qty_next = True
     ss.qty_staged = 0
+    st.rerun()
     return True
 
 if add_to_batch_click:
