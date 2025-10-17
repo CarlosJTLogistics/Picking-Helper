@@ -1,5 +1,6 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.6.1 — Default Pallet QTY to QTYOnHand; remove Order # from sidebar; manual lookup flow; cache reset.
+# v1.6.2 — Fix AIM prefix strip; default LOT->CustomerLotReference; QTY->QTYOnHand; expand auto-guess/aliases
+
 import os
 import io
 import re
@@ -67,7 +68,6 @@ KIOSK = CFG["kiosk"]
 ss = st.session_state
 defaults = {
     "operator": "",
-    # "current_order": "",  # removed from sidebar; schema kept blank on write
     "current_location": "",
     "current_pallet": "",
     "sku": "",
@@ -76,8 +76,8 @@ defaults = {
     "scan": "",
     "staging_scan": "",
     "typed_staging": "",
-    "qty_picked_str": "",          # text input to appear blank initially
-    "qty_staged": 0,               # internal numeric (kept for compatibility)
+    "qty_picked_str": "",          # text input so it starts blank
+    "qty_staged": 0,               # internal numeric
     "starting_qty": None,
     "picked_so_far": {},
     "recent_scans": [],
@@ -100,7 +100,8 @@ def clean_scan(raw: str) -> str:
     return (raw or "").replace("\r", "").replace("\n", "").strip()
 
 def strip_aim_prefix(s: str) -> str:
-    m = re.match(r"^\]\[A-Za-z]\d", s)
+    # Fix: correctly remove patterns like "]C1", "]A0", etc.
+    m = re.match(r"^\][A-Za-z]\d", s)
     return s[m.end():] if m else s
 
 def safe_int(x, default=0) -> int:
@@ -174,9 +175,11 @@ def _auto_guess_cols(columns: List[str]) -> Dict[str, Optional[str]]:
     return {
         "pallet":   pick(["pallet","pallet id","pallet_id","lpn","license","serial","sscc"]),
         "sku":      pick(["sku","item","itemcode","product","part","material"]),
-        "lot":      pick(["lot","lot_number","lot #","lot#","batch","batchno"]),
+        # Add CustomerLotReference as a direct synonym (lower-cased)
+        "lot":      pick(["customerlotreference","customer lot reference","lot","lot_number","lot #","lot#","batch","batchno"]),
         "location": pick(["location","loc","bin","slot","binlocation","location code","staging","stg"]),
-        "qty":      pick(["qty","quantity","cases","casecount","count","units","pallet_qty","onhand","on_hand"]),
+        # Add qtyonhand so QTYOnHand maps automatically
+        "qty":      pick(["qtyonhand","qty","quantity","cases","casecount","count","units","pallet_qty","onhand","on_hand"]),
     }
 
 @st.cache_data(show_spinner=False)
@@ -365,7 +368,8 @@ def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
         "location": ["location","loc","bin","slot","staging","stg","binlocation","location code"],
         "pallet":   ["pallet","pallet_id","pallet id","serial","id","license","lpn","sscc"],
         "sku":      ["sku","item","itemcode","product","part","material"],
-        "lot":      ["lot","lot_number","lot #","lot#","batch","batchno"],
+        # Include CustomerLotReference as an alias
+        "lot":      ["customerlotreference","customer lot reference","lot","lot_number","lot #","lot#","batch","batchno"],
     }
     out: Dict[str,str] = {}
     lower_data = {k.lower(): str(v) for k, v in data.items()}
@@ -401,14 +405,11 @@ def parse_any_scan(raw_code: str) -> Dict[str,str]:
 
 # -------------------- SIDEBAR --------------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.6.1 (QTYOnHand default • Order# removed • manual lookup)", icon="🧭")
+    st.info("BUILD: outbound-batch v1.6.2 (LOT->CustomerLotReference • QTY->QTYOnHand • AIM fix)", icon="🧭")
     st.caption(f"Config source: **{CFG['_source']}**")
 
     st.markdown("### ⚙️ Settings")
     ss["operator"] = st.text_input("Picker Name (required)", value=ss.operator, placeholder="e.g., Carlos")
-
-    # Removed Order # input from the sidebar
-    # ss["current_order"] = st.text_input("Order # (optional)", value=ss.current_order, placeholder="e.g., SO-12345")
 
     st.write("**Log file:**", f"`{LOG_FILE}`")
     st.caption(f"Recipients: {', '.join(NOTIFY_TO)}")
@@ -419,9 +420,9 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("#### Inventory Lookup (manual)")
-    st.caption("Upload your latest RAMP export (CSV/XLS/XLSX). Scans will auto-fill from this file + any data encoded in the barcode.")
+    st.caption("Upload your latest RAMP export (CSV/XLS/XLSX). Scans will auto-fill from this file + barcode contents.")
     uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv","xlsx","xls"], accept_multiple_files=False)
-    # Clear cache button to force re-read of a changed file
+
     cols_btn = st.columns([1,1])
     with cols_btn[0]:
         if st.button("↻ Clear lookup cache", use_container_width=True):
@@ -438,7 +439,6 @@ with st.sidebar:
     df, guessed = None, None
     lookup_error = None
     try:
-        # If you want *only* manual, set LOOKUP_FILE_ENV="" in Secrets — still keep fallback for convenience.
         df, guessed = load_lookup(LOOKUP_FILE_ENV if not up_bytes else None, up_bytes)
         ss.lookup_df = df
     except Exception as e:
@@ -450,21 +450,20 @@ with st.sidebar:
         st.success(f"Loaded lookup with {len(ss.lookup_df):,} rows")
         cols = list(ss.lookup_df.columns)
 
-        # Preferred defaults — prioritize 'QTYOnHand', then common variants
+        # Preferred defaults — exact matches if present
         desired_defaults = {
             "pallet": "PalletID",
-            "lot": "CustomerLot Reference",
+            "lot": "CustomerLotReference",    # <-- fixed
             "sku": "WarehouseSku",
             "location": "LocationName",
-            "qty": None,  # handled below with candidates
+            "qty": None,  # handled by candidates below
         }
-        # Start from guessed, then apply desired if present
         g = guessed or {"pallet": None, "sku": None, "lot": None, "location": None, "qty": None}
         for key, want in desired_defaults.items():
             if want and want in cols:
                 g[key] = want
 
-        # QTY preferred candidates
+        # QTY preferred candidates — prioritize QTYOnHand
         qty_candidates = ["QTYOnHand", "QTY On Hand", "OnHandQty", "On Hand", "On_Hand"]
         for qn in qty_candidates:
             if qn in cols:
@@ -546,7 +545,6 @@ _focus_first_text()
 # -------------------- SCAN HANDLERS --------------------
 def _apply_lookup_into_state(pallet_id: str):
     if ss.lookup_df is None:
-        # fallback only to starting_qty if set
         if ss.starting_qty and pallet_id:
             ss.pallet_qty = clamp_nonneg(safe_int(ss.starting_qty, 0))
             ss.start_qty_by_pallet[pallet_id] = ss.pallet_qty
@@ -674,6 +672,18 @@ qty_str = st.text_input(
 )
 ss.qty_staged = safe_int(qty_str, 0)
 
+def _focus_qty_input():
+    st.markdown("""
+    <script>
+    const f = () => {
+      const els = Array.from(window.parent.document.querySelectorAll('input[aria-label]'));
+      const el = els.find(i => i.getAttribute('aria-label')?.toLowerCase()?.includes('enter qty picked'));
+      if (el) { el.focus(); el.select(); }
+    };
+    setTimeout(f, 150);
+    </script>
+    """, unsafe_allow_html=True)
+
 if ss.focus_qty:
     _focus_qty_input()
     ss.focus_qty = False
@@ -717,13 +727,13 @@ def _add_current_line_to_batch():
         q = 15
     upsert_picked(ss.current_pallet, q)
     line = {
-        "order_number": "",  # schema retained; we now keep it blank
+        "order_number": "",  # schema retained: left blank
         "source_location": ss.current_location or "",
         "staging_location": ss.staging_location_current or "",
         "pallet_id": ss.current_pallet,
         "sku": ss.sku or "",
         "lot_number": ss.lot_number or "",
-        "qty_staged": int(q),  # keeping internal field name
+        "qty_staged": int(q),  # keep internal field name for compatibility
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     ss.batch_rows.append(line)
@@ -739,6 +749,13 @@ def _add_current_line_to_batch():
 if add_to_batch_click:
     _add_current_line_to_batch()
 
+if clear_batch and ss.batch_rows:
+    for r in ss.batch_rows:
+        upsert_picked(r.get("pallet_id",""), -safe_int(r.get("qty_staged"),0))
+    ss.undo_stack.append(("remove_all", ss.batch_rows.copy()))
+    ss.batch_rows = []
+    st.warning("Batch cleared.")
+
 if undo_last:
     if ss.batch_rows:
         last = ss.batch_rows.pop()
@@ -751,13 +768,6 @@ if undo_last:
             ss.batch_rows.append(row)
             upsert_picked(row.get("pallet_id",""), safe_int(row.get("qty_staged"),0))
             st.success(f"Restored line for pallet {row.get('pallet_id','?')}.")
-
-if clear_batch and ss.batch_rows:
-    for r in ss.batch_rows:
-        upsert_picked(r.get("pallet_id",""), -safe_int(r.get("qty_staged"),0))
-    ss.undo_stack.append(("remove_all", ss.batch_rows.copy()))
-    ss.batch_rows = []
-    st.warning("Batch cleared.")
 
 # -------------------- REVIEW & SUBMIT --------------------
 st.markdown("---")
