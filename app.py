@@ -937,4 +937,4 @@ if os.path.exists(LOG_FILE):
     except Exception:
         st.code(open(LOG_FILE, "r", encoding="utf-8", errors="ignore").read().splitlines()[-10:])
 else:
-    st.info("No log entries yet today.")day.")
+    st.info("No log entries yet today.")
