@@ -1,6 +1,5 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.4 — Remove 8304 trim rule; use st.rerun(); scan OR type for Pallet/Location/LOT; warning icon for location
-
+# v1.4.2 — QR compatibility hotfix: GS1 (single-paren) + GS1 FNC1 + label-style key:value; raw scan debugger
 import os
 import io
 import re
@@ -9,18 +8,17 @@ import csv
 import sys
 import time
 import platform
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from urllib.parse import urlparse, parse_qs, unquote_plus
 from datetime import datetime
 from pathlib import Path
-
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
-# ---------------- PAGE SETUP ----------------
+# ------------------ PAGE SETUP ------------------
 st.set_page_config(page_title="Picking Helper", page_icon="📦", layout="wide")
 
-# ---------------- ENV / PATHS ----------------
+# ------------------ ENV / PATHS ------------------
 TODAY = datetime.now().strftime("%Y-%m-%d")
 LOG_DIR = os.getenv("PICKING_HELPER_LOG_DIR", "logs")
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
@@ -45,31 +43,31 @@ NOTIFY_TO = _parse_notify_to(NOTIFY_TO_ENV)
 KIOSK = os.getenv("PICKING_HELPER_KIOSK", "0").strip() == "1"
 LOOKUP_FILE_ENV = os.getenv("PICKING_HELPER_LOOKUP_FILE", "").strip()
 
-# --------------- SESSION STATE ---------------
+# ------------------ SESSION STATE ------------------
 ss = st.session_state
 defaults = {
     # identity / context
     "operator": "",
-    "current_order": "",               # optional
+    "current_order": "",  # optional
     # live fields
-    "current_location": "",            # source location
+    "current_location": "",  # source location
     "current_pallet": "",
     "sku": "",
     "lot_number": "",
     "staging_location_current": "",
     # scans/typing buffers
-    "scan": "",                        # pallet scan
-    "source_scan": "",                 # source location scan
-    "typed_source": "",                # source location typed
-    "typed_pallet_id": "",             # typed pallet
-    "lot_scan": "",                    # lot scan
-    "typed_lot": "",                   # typed lot
-    "staging_scan": "",                # staging scan
+    "scan": "",  # pallet scan
+    "source_scan": "",  # source location scan
+    "typed_source": "",  # source location typed
+    "typed_pallet_id": "",  # typed pallet
+    "lot_scan": "",  # lot scan
+    "typed_lot": "",  # typed lot
+    "staging_scan": "",  # staging scan
     # qty
-    "qty_staged": 0,                   # numeric only (no presets)
+    "qty_staged": 0,  # numeric only (no presets)
     # misc
-    "starting_qty": None,              # optional for Remaining calc
-    "picked_so_far": {},               # pallet_id -> picked qty sum
+    "starting_qty": None,  # optional for Remaining calc
+    "picked_so_far": {},  # pallet_id -> picked qty sum
     "recent_scans": [],
     "tag_bytes": None,
     # lookup
@@ -77,13 +75,15 @@ defaults = {
     "lookup_cols": {"pallet": None, "sku": None, "lot": None, "location": None},
     # batch
     "batch_rows": [],
+    # debug
+    "last_raw_scan": "",
 }
 for k, v in defaults.items():
     if k not in ss:
         ss[k] = v
-
-# --------------- HELPERS ----------------
+# ------------------ HELPERS ------------------
 def clean_scan(raw: str) -> str:
+    # Keep control chars like \x1D for GS1 FNC1; only strip CR/LF and leading/trailing spaces.
     return (raw or "").replace("\r", "").replace("\n", "").strip()
 
 def append_log_row(row: dict):
@@ -107,11 +107,11 @@ def make_partial_tag_png(location: str, pallet: str, qty_remaining: Optional[int
     d = ImageDraw.Draw(img)
     try:
         font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 48)
-        font_body  = ImageFont.truetype("DejaVuSans.ttf", 34)
+        font_body = ImageFont.truetype("DejaVuSans.ttf", 34)
         font_small = ImageFont.truetype("DejaVuSans.ttf", 24)
     except Exception:
         font_title = ImageFont.load_default()
-        font_body  = ImageFont.load_default()
+        font_body = ImageFont.load_default()
         font_small = ImageFont.load_default()
     d.rectangle([0, 0, W, 90], fill=(6, 83, 164))
     d.text((24, 20), "PARTIAL PALLET TAG", font=font_title, fill="white")
@@ -145,7 +145,7 @@ def normalize_lot(lot: Optional[str]) -> str:
 def _is_valid_source_location(loc: str) -> bool:
     return bool(loc) and loc.isdigit() and len(loc) == 8
 
-# --------------- LOOKUP SUPPORT ---------------
+# ------------------ LOOKUP SUPPORT ------------------
 def _auto_guess_cols(columns: List[str]) -> Dict[str, Optional[str]]:
     cols_lower = {c.lower(): c for c in columns}
     def pick(syns: List[str]) -> Optional[str]:
@@ -158,9 +158,9 @@ def _auto_guess_cols(columns: List[str]) -> Dict[str, Optional[str]]:
                 return c
         return None
     return {
-        "pallet":   pick(["pallet","pallet id","pallet_id","lpn","license","serial","sscc"]),
-        "sku":      pick(["sku","item","itemcode","product","part","material"]),
-        "lot":      pick(["lot","lot_number","batch","batchno"]),
+        "pallet": pick(["pallet","pallet id","pallet_id","lpn","license","serial","sscc"]),
+        "sku": pick(["sku","item","itemcode","product","part","material"]),
+        "lot": pick(["lot","lot_number","batch","batchno"]),
         "location": pick(["location","loc","bin","slot","staging","stg"]),
     }
 
@@ -199,7 +199,6 @@ def load_lookup(path: Optional[str], uploaded_bytes: Optional[bytes]):
         df.columns = [str(c).strip() for c in df.columns]
         return df, _auto_guess_cols(list(df.columns))
     return None, None
-
 def lookup_fields_by_pallet(df, colmap: Dict[str, Optional[str]], pallet_id: str) -> Dict[str,str]:
     out = {}
     if df is None or not pallet_id:
@@ -218,15 +217,173 @@ def lookup_fields_by_pallet(df, colmap: Dict[str, Optional[str]], pallet_id: str
     except Exception:
         pass
     return out
+# ------------------ SCAN PARSERS (expanded) ------------------
+def try_parse_json(s: str) -> Optional[Dict[str,str]]:
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
 
-# --------------- SIDEBAR ----------------
+def try_parse_query_or_kv(s: str) -> Optional[Dict[str,str]]:
+    # URL query or "k=v" separated by &, ;, commas, spaces, or newlines
+    if "://" in s:
+        parsed = urlparse(s)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        return {k.lower(): unquote_plus(v[-1]) if v else "" for k, v in qs.items()} or None
+    s2 = s.replace(";", "&").replace("\n", "&").replace(",", "&").replace("  ", " ")
+    parts = [p for p in re.split(r"[& ]", s2) if p]
+    kv = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            kv[k.strip().lower()] = unquote_plus(v.strip())
+        elif ":" in p:
+            k, v = p.split(":", 1)
+            kv[k.strip().lower()] = v.strip()
+    return kv or None
+
+def try_parse_label_kv(s: str) -> Optional[Dict[str,str]]:
+    """
+    Parses human-readable labels like:
+      Pallet ID: JTL00496
+      LOT: 9062716
+      Location: 11400804
+    Lines may be separated by newline, ';', or ','.
+    """
+    lines = re.split(r"[\n;,]+", s)
+    out = {}
+    for line in lines:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k = k.strip().lower(); v = v.strip()
+            if k and v:
+                out[k] = v
+    return out or None
+
+def try_parse_gs1_paren(s: str) -> Optional[Dict[str,str]]:
+    """
+    Parses GS1 AI with *single* parentheses, e.g.:
+      (21)SERIAL(10)LOT(01)GTIN
+    """
+    pairs = re.findall(r"\((\d{2,4})\)([^()]+)", s)
+    if not pairs:
+        return None
+    out: Dict[str,str] = {}
+    for ai, val in pairs:
+        val = val.strip()
+        if ai == "21": out["pallet"] = val  # Serial/LPN
+        elif ai == "10": out["lot"] = val
+        elif ai == "01": out["gtin"] = val
+        elif ai == "00": out["pallet"] = val  # SSCC as pallet if present
+    return out or None
+
+def try_parse_gs1_fnc1(s: str) -> Optional[Dict[str,str]]:
+    """
+    Parses GS1 AI with FNC1 (ASCII 29) separators. Example raw:
+      "010123456789012121JTL00496\x1D109062716"
+    """
+    GS = "\x1D"
+    if GS not in s and not re.match(r"^\d{2,4}", s):
+        return None
+
+    # Known AIs
+    AI_FIXED = {"00":18, "01":14, "414":13}  # SSCC, GTIN, GLN (if present)
+    AI_VAR = {"10","21","240","241","420"}   # LOT, SERIAL/LPN, etc.
+
+    i = 0
+    n = len(s)
+    out: Dict[str,str] = {}
+
+    def read_ai(idx: int) -> Tuple[Optional[str], int]:
+        # Try 4, 3, then 2-digit AI
+        for L in (4,3,2):
+            if idx+L <= n and s[idx:idx+L].isdigit():
+                return s[idx:idx+L], idx+L
+        return None, idx+1
+
+    while i < n:
+        if not s[i].isdigit():
+            i += 1
+            continue
+        ai, j = read_ai(i)
+        if not ai:
+            i += 1
+            continue
+        if ai in AI_FIXED:
+            L = AI_FIXED[ai]
+            if j+L <= n:
+                val = s[j:j+L]
+                i = j+L
+            else:
+                val = s[j:]
+                i = n
+        elif ai in AI_VAR:
+            # Read until GS or end
+            k = s.find(GS, j)
+            if k == -1:
+                val = s[j:]
+                i = n
+            else:
+                val = s[j:k]
+                i = k+1
+        else:
+            # Unknown AI; skip to next separator or char
+            next_gs = s.find(GS, j)
+            if next_gs == -1:
+                i = n
+            else:
+                i = next_gs+1
+            continue
+
+        val = val.strip()
+        if ai == "21": out["pallet"] = val
+        elif ai == "10": out["lot"] = val
+        elif ai == "01": out["gtin"] = val
+        elif ai == "00": out["pallet"] = val  # Use SSCC as pallet when 21 absent
+
+    return out or None
+
+def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
+    key_map = {
+        "location": ["location","loc","bin","slot","staging","stg"],
+        "pallet": ["pallet","pallet_id","serial","id","license","lpn","sscc","pallet id"],
+        "sku": ["sku","item","itemcode","product","part","material"],
+        "lot": ["lot","lot_number","batch","batchno"],
+    }
+    out: Dict[str,str] = {}
+    lower_data = {k.lower(): str(v) for k, v in data.items()}
+    for target, aliases in key_map.items():
+        for a in aliases:
+            if a in lower_data and lower_data[a]:
+                out[target] = lower_data[a].strip()
+                break
+    if "lot" in out:
+        out["lot"] = normalize_lot(out["lot"])
+    return out
+
+def parse_any_scan(code: str) -> Dict[str,str]:
+    """
+    Try multiple strategies to extract pallet/location/sku/lot from a raw scan.
+    Order: JSON -> query/kv -> GS1 (paren) -> GS1 (FNC1) -> label kv.
+    """
+    for fn in (try_parse_json, try_parse_query_or_kv, try_parse_gs1_paren, try_parse_gs1_fnc1, try_parse_label_kv):
+        try:
+            parsed = fn(code)
+        except Exception:
+            parsed = None
+        if parsed:
+            norm = normalize_keys(parsed)
+            if norm:
+                return norm
+    return {}
+
+# ------------------ SIDEBAR ------------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.4 (no 8304; st.rerun)", icon="🧭")
+    st.info("BUILD: outbound-batch v1.4.2 (QR GS1/FNC1 hotfix)", icon="🧭")
     st.markdown("### ⚙️ Settings")
-
     ss["operator"] = st.text_input("Operator (optional)", value=ss.operator, placeholder="e.g., Carlos")
     ss["current_order"] = st.text_input("Order # (optional)", value=ss.current_order, placeholder="e.g., SO-12345")
-
     st.write("**Log file:**", f"`{LOG_FILE}`")
     st.caption(f"Recipients: {', '.join(NOTIFY_TO)}")
     if WEBHOOK_URL:
@@ -256,9 +413,9 @@ with st.sidebar:
         c1, c2 = st.columns(2)
         with c1:
             ss.lookup_cols["pallet"] = st.selectbox("Pallet column", options=cols, index=cols.index(g["pallet"]) if g["pallet"] in cols else 0)
-            ss.lookup_cols["sku"]    = st.selectbox("SKU column", options=["(none)"] + cols, index=(cols.index(g["sku"]) + 1) if g["sku"] in cols else 0)
+            ss.lookup_cols["sku"] = st.selectbox("SKU column", options=["(none)"] + cols, index=(cols.index(g["sku"]) + 1) if g["sku"] in cols else 0)
         with c2:
-            ss.lookup_cols["lot"]    = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g["lot"]) + 1) if g["lot"] in cols else 0)
+            ss.lookup_cols["lot"] = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g["lot"]) + 1) if g["lot"] in cols else 0)
             ss.lookup_cols["location"] = st.selectbox("Location column", options=["(none)"] + cols, index=(cols.index(g["location"]) + 1) if g["location"] in cols else 0)
         for k in ["sku","lot","location"]:
             if ss.lookup_cols.get(k) == "(none)":
@@ -272,7 +429,6 @@ with st.sidebar:
         help="Only needed if you want Remaining computed."
     )
     st.caption("Max staged per line remains 15 cases (validation).")
-
     if KIOSK:
         st.caption("KIOSK MODE enabled (menu/footer hidden).")
 
@@ -290,11 +446,11 @@ with st.sidebar:
 if KIOSK:
     st.markdown("""
     <style>
-      #MainMenu, footer {visibility:hidden;}
+    #MainMenu, footer {visibility:hidden;}
     </style>
     """, unsafe_allow_html=True)
 
-# --------------- HEADER ----------------
+# ------------------ HEADER ------------------
 st.title("📦 Picking Helper — Outbound (Batch)")
 st.caption("Scan or type Pallet / Location / LOT → set QTY staged (max 15) → scan/type Staging → Add to batch → Review & Submit")
 
@@ -309,69 +465,17 @@ st.markdown("""
 </script>
 """, unsafe_allow_html=True)
 
-# --------------- PARSERS ----------------
-def try_parse_json(s: str) -> Optional[Dict[str,str]]:
-    try:
-        obj = json.loads(s)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
-
-def try_parse_query_or_kv(s: str) -> Optional[Dict[str,str]]:
-    if "://" in s:
-        parsed = urlparse(s)
-        qs = parse_qs(parsed.query, keep_blank_values=True)
-        return {k.lower(): unquote_plus(v[-1]) if v else "" for k, v in qs.items()} or None
-    s2 = s.replace(";", "&").replace("\n", "&")
-    if "=" in s2:
-        parts = [p for p in s2.split("&") if p]
-        kv = {}
-        for p in parts:
-            if "=" in p:
-                k, v = p.split("=", 1)
-                kv[k.strip().lower()] = unquote_plus(v.strip())
-        return kv or None
-    return None
-
-def try_parse_gs1_paren(s: str) -> Optional[Dict[str,str]]:
-    pairs = re.findall(r"\((\d{2,4})\)([^\(\)]+)", s)
-    if not pairs: return None
-    out: Dict[str,str] = {}
-    for ai, val in pairs:
-        val = val.strip()
-        if ai == "21": out["pallet"] = val
-        elif ai == "10": out["lot"] = val
-        elif ai == "01": out["gtin"] = val
-    return out or None
-
-def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
-    key_map = {
-        "location": ["location","loc","bin","slot","staging","stg"],
-        "pallet":   ["pallet","pallet_id","serial","id","license","lpn","sscc"],
-        "sku":      ["sku","item","itemcode","product","part","material"],
-        "lot":      ["lot","lot_number","batch","batchno"],
-    }
-    out: Dict[str,str] = {}
-    lower_data = {k.lower(): str(v) for k, v in data.items()}
-    for target, aliases in key_map.items():
-        for a in aliases:
-            if a in lower_data and lower_data[a]:
-                out[target] = lower_data[a].strip()
-                break
-    if "lot" in out:
-        out["lot"] = normalize_lot(out["lot"])
-    return out
-
-# --------------- SCAN/TYPING HANDLERS ---------------
+# ------------------ SCAN/TYPING HANDLERS ------------------
 def on_pallet_scan():
-    # NOTE: the 8304 trimming rule has been removed; use scan as-is.
     raw = ss.scan or ""
     code = clean_scan(raw)
     if not code:
         return
-    # Try rich parsing; if none, fall back to the scanned code as the pallet ID
-    parsed = (try_parse_json(code) or try_parse_query_or_kv(code) or try_parse_gs1_paren(code) or {})
-    norm = normalize_keys(parsed) if parsed else {}
+    ss.last_raw_scan = raw  # keep true raw (before clean) for debugging
+
+    # Parse using multiple strategies
+    norm = parse_any_scan(code)
+
     pallet_id = norm.get("pallet") or code
     ss.current_pallet = pallet_id
 
@@ -379,6 +483,7 @@ def on_pallet_scan():
     sku = norm.get("sku")
     lot = norm.get("lot")
 
+    # Lookup fallback
     if ss.lookup_df is not None and (not loc or not sku or not lot):
         lookup_map = {
             "pallet": ss.lookup_cols.get("pallet"),
@@ -399,7 +504,7 @@ def on_pallet_scan():
     if ss.current_location: bits.append(f"Location {ss.current_location}")
     if ss.sku: bits.append(f"SKU {ss.sku}")
     if ss.lot_number: bits.append(f"LOT {ss.lot_number}")
-    st.toast(" \n".join(bits), icon="✅")
+    st.toast("\n".join(bits), icon="✅")
 
     ss.recent_scans.insert(0, (datetime.now().strftime("%H:%M:%S"), code))
     ss.recent_scans = ss.recent_scans[:25]
@@ -461,25 +566,39 @@ def set_typed_lot():
     ss.lot_number = val
     st.toast(f"LOT set: {val}", icon="✍️")
 
-# --------------- MAIN UI ----------------
+# ------------------ MAIN UI ------------------
 # A) Pallet — scan or type
 st.subheader("Pallet ID")
 cP1, cP2 = st.columns([2, 1])
 with cP1:
     st.text_input("Scan pallet here", key="scan",
-                  placeholder="Scan pallet barcode (raw scan is used; JSON/query/GS1 parsed if present)",
-                  on_change=on_pallet_scan)
+        placeholder="Scan pallet barcode (JSON/query/GS1/label parsed if present)",
+        on_change=on_pallet_scan)
 with cP2:
     st.text_input("…or type Pallet ID", key="typed_pallet_id", placeholder="e.g., JTL00496")
     st.button("Set Pallet", on_click=set_typed_pallet, use_container_width=True)
+
+with st.expander("🔍 Raw Scan Debugger (last pallet scan)", expanded=False):
+    if ss.last_raw_scan:
+        raw = ss.last_raw_scan
+        st.code(repr(raw), language="text")
+        # Show code points (helpful to spot \x1D FNC1)
+        hexes = " ".join(f"{ord(c):02X}" for c in raw)
+        st.caption(f"Hex bytes: {hexes}")
+        if "\x1D" in raw:
+            st.success("Detected ASCII 29 (FNC1) in the raw scan — GS1 mode.", icon="✅")
+        else:
+            st.info("No FNC1 (ASCII 29) detected in raw scan.", icon="ℹ️")
+    else:
+        st.caption("No raw pallet scan captured yet.")
 
 # B) Source Location — scan or type
 st.subheader("Source Location")
 cL1, cL2 = st.columns([2, 1])
 with cL1:
     st.text_input("Scan source location here", key="source_scan",
-                  placeholder="Scan location barcode (e.g., 11400804)",
-                  on_change=on_source_scan)
+        placeholder="Scan location barcode (e.g., 11400804)",
+        on_change=on_source_scan)
 with cL2:
     st.text_input("…or type location", key="typed_source", placeholder="e.g., 11400804")
     st.button("Set Location", on_click=set_typed_source, use_container_width=True)
@@ -496,8 +615,8 @@ st.subheader("LOT Number")
 cLot1, cLot2 = st.columns([2, 1])
 with cLot1:
     st.text_input("Scan LOT here", key="lot_scan",
-                  placeholder="Scan LOT barcode (digits preferred)",
-                  on_change=on_lot_scan)
+        placeholder="Scan LOT barcode (digits preferred)",
+        on_change=on_lot_scan)
 with cLot2:
     st.text_input("…or type LOT", key="typed_lot", placeholder="e.g., 9062716")
     st.button("Set LOT", on_click=set_typed_lot, use_container_width=True)
@@ -507,8 +626,8 @@ st.subheader("Staging Location")
 cS1, cS2 = st.columns([2, 1])
 with cS1:
     st.text_input("Scan staging here", key="staging_scan",
-                  placeholder="Scan staging barcode (e.g., STAGE-01)",
-                  on_change=on_staging_scan)
+        placeholder="Scan staging barcode (e.g., STAGE-01)",
+        on_change=on_staging_scan)
 with cS2:
     st.text_input("…or type staging", key="staging_location_current", placeholder="e.g., STAGE-01")
 
@@ -523,14 +642,12 @@ with c5: st.metric("LOT Number", ss.lot_number or "—")
 with c6:
     rem = get_remaining(ss.starting_qty if ss.starting_qty != 0 else None, ss.current_pallet) if ss.current_pallet else None
     st.metric("Remaining (est.)", "—" if rem is None else rem)
-
 with st.expander("Recent scans", expanded=False):
     if ss.recent_scans:
         for t, c in ss.recent_scans[:10]:
             st.write(f"🕒 {t} — **{c}**")
     else:
         st.info("No scans yet.")
-
 st.markdown("---")
 
 # QTY staged — numeric only (no presets)
@@ -545,7 +662,6 @@ ss.qty_staged = qty_staged
 # Optional running tracker
 st.subheader("Pick (optional tracker)")
 pick_qty = st.number_input("Qty picked", min_value=0, step=1, value=0)
-
 colA, colB, colC, colD = st.columns([1,1,1,1])
 with colA:
     add_to_batch = st.button("➕ Add to Batch", use_container_width=True)
@@ -563,7 +679,7 @@ with colC:
 with colD:
     clear_batch = st.button("🗑️ Clear Batch", use_container_width=True, disabled=not ss.batch_rows)
 
-# ---------- Add to Batch ----------
+# ---- Add to Batch ----
 if add_to_batch:
     if not ss.current_pallet:
         st.error("Set a **Pallet ID** (scan or type) before adding.")
@@ -592,7 +708,7 @@ if add_to_batch:
         # reset qty only
         ss.qty_staged = 0
 
-# ---------- Tag generation ----------
+# ---- Tag generation ----
 if do_tag:
     if not ss.current_pallet:
         st.error("Set a **Pallet ID** before generating a tag.")
@@ -604,7 +720,6 @@ if do_tag:
             qty_remaining=remaining,
             operator=ss.operator or ""
         )
-
 if ss.tag_bytes:
     st.subheader("Partial Pallet Tag")
     st.image(ss.tag_bytes, caption="Preview", use_column_width=True)
@@ -620,10 +735,9 @@ if clear_batch and ss.batch_rows:
     ss.batch_rows = []
     st.warning("Batch cleared.")
 
-# --------------- REVIEW & SUBMIT ----------------
+# ------------------ REVIEW & SUBMIT ------------------
 st.markdown("---")
 st.subheader("Review & Submit")
-
 if not ss.batch_rows:
     st.info("No items in the batch yet. Add lines above.")
 else:
@@ -632,7 +746,6 @@ else:
         df_batch = pd.DataFrame(ss.batch_rows)
     except Exception:
         df_batch = None
-
     if df_batch is not None:
         st.caption("Edit QTY or fields if needed (0-qty rows are dropped). Then **Apply Edits** → **Submit All**.")
         edited = st.data_editor(
@@ -713,7 +826,6 @@ else:
                         "totals": {"lines": len(ss.batch_rows), "qty_staged_sum": totals_qty},
                         "notify_to": NOTIFY_TO,  # recipients for Flow
                     }
-
                     # Send to webhook (if configured)
                     sent_ok = False
                     send_error = None
@@ -725,9 +837,15 @@ else:
                             sent_ok = True
                         except Exception as e:
                             send_error = str(e)
-
                     # Write CSV rows locally (audit)
+                    # Also attempt to fill qty_picked & remaining_after if starting_qty present
                     for r in ss.batch_rows:
+                        qty_picked = ""  # unknown per-line unless you use the optional tracker
+                        remaining_after = ""
+                        if ss.starting_qty and ss.current_pallet and r.get("pallet_id") == ss.current_pallet:
+                            # best-effort: compute remaining using running tracker
+                            current_picked = ss.picked_so_far.get(ss.current_pallet, 0)
+                            remaining_after = max(ss.starting_qty - current_picked, 0)
                         append_log_row({
                             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             "operator": ss.operator or "",
@@ -738,33 +856,31 @@ else:
                             "sku": r.get("sku",""),
                             "lot_number": r.get("lot_number",""),
                             "qty_staged": int(r.get("qty_staged", 0)) or "",
-                            "qty_picked": "",
+                            "qty_picked": qty_picked,
                             "starting_qty": (ss.starting_qty if ss.starting_qty != 0 else ""),
-                            "remaining_after": "",
+                            "remaining_after": remaining_after,
                             "batch_id": batch_id,
                             "action": "SUBMIT",
                         })
-
                     # Save JSON backup of payload
                     try:
                         with open(os.path.join(LOG_DIR, f"{batch_id}.json"), "w", encoding="utf-8") as jf:
                             json.dump(payload, jf, ensure_ascii=False, indent=2)
                     except Exception:
                         pass
-
                     if WEBHOOK_URL and not sent_ok:
                         st.error(f"Submit saved locally, but webhook failed: {send_error}")
                     else:
                         st.success("Submitted! Admin will receive the email/Teams notification.")
-                        ss.batch_rows = []
-                        st.toast(
-                            f"Batch {batch_id} submitted — {payload['totals']['lines']} lines / {payload['totals']['qty_staged_sum']} cases.",
-                            icon="📨"
-                        )
-                        time.sleep(0.5)
-                        st.rerun()  # updated API (replaces deprecated st.experimental_rerun)
+                    ss.batch_rows = []
+                    st.toast(
+                        f"Batch {batch_id} submitted — {payload['totals']['lines']} lines / {payload['totals']['qty_staged_sum']} cases.",
+                        icon="📨"
+                    )
+                    time.sleep(0.5)
+                    st.rerun()
 
-# -------- Log table preview (today) --------
+# ------------------ Today’s Log Preview ------------------
 st.markdown("---")
 st.subheader("Today’s Log (preview)")
 if os.path.exists(LOG_FILE):
