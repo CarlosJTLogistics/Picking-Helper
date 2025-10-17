@@ -1,6 +1,7 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.9.1 — Picker Name on main • Pallet scan gated by Picker • Sticky Action Bar • Color Status • Floating Summary • Global Batch Cap • Duplicate Merge
-# Offline queue + retry • Voice feedback (toggle) • EN/ES i18n • Mobile UI
+# v1.9.3 — UI order: Picker → Pallet → QTY → Staging (last)
+# Picker-gated pallet scan • Sticky Action Bar • Color Status • Floating Summary
+# Global Batch Cap • Duplicate Merge • Offline queue + retry • Voice feedback (toggle) • EN/ES i18n • Mobile UI
 import os
 import io
 import re
@@ -18,7 +19,7 @@ import streamlit as st
 # -------------------- PAGE SETUP --------------------
 st.set_page_config(page_title="Picking Helper", page_icon="📦", layout="wide")
 
-# --- Mobile-friendly CSS (placeholders – customize as needed)
+# -------------------- Mobile-friendly CSS (placeholder) --------------------
 st.markdown("""
 """, unsafe_allow_html=True)
 
@@ -30,7 +31,6 @@ def _get_cfg():
         if val in (None, "", []):
             val = os.getenv(env, default)
         return val
-
     cfg = {
         "webhook_url": get("webhook_url", "PICKING_HELPER_WEBHOOK_URL", ""),
         "teams_webhook_url": get("teams_webhook_url", "PICKING_HELPER_TEAMS_WEBHOOK_URL", ""),
@@ -49,7 +49,6 @@ def _get_cfg():
         "voice_feedback": str(get("voice_feedback", "PICKING_HELPER_VOICE", "0")).strip().lower() in ("1","true","yes"),
         "retry_pending_on_start": str(get("retry_pending_on_start", "PICKING_HELPER_RETRY_PENDING", "1")).strip().lower() in ("1","true","yes"),
     }
-
     nt = cfg["notify_to"]
     if isinstance(nt, list):
         notify = nt
@@ -101,13 +100,12 @@ TODAY = now_local().strftime("%Y-%m-%d")
 LOG_DIR = CFG["log_dir"] or "logs"
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"picking-log-{TODAY}.csv")
-
 WEBHOOK_URL = (CFG["webhook_url"] or "").strip()
 TEAMS_WEBHOOK_URL = (CFG["teams_webhook_url"] or "").strip()
 NOTIFY_TO: List[str] = CFG["notify_to"]
 LOOKUP_FILE_ENV = (CFG["lookup_file"] or "").strip()
 
-# Persistent lookup paths (as in v1.8)
+# Persistent lookup paths
 PERSIST_DIR = os.path.join(LOG_DIR, "lookup")
 Path(PERSIST_DIR).mkdir(parents=True, exist_ok=True)
 META_PATH = os.path.join(PERSIST_DIR, "lookup_meta.json")
@@ -221,6 +219,8 @@ defaults = {
     "clear_top_next": False,
     # i18n
     "lang": CFG.get("language","en"),
+    # one-time auto-retry flag
+    "retried_on_start": False,
 }
 for k, v in defaults.items():
     if k not in ss:
@@ -231,7 +231,7 @@ def clean_scan(raw: str) -> str:
     return (raw or "").replace("\r", "").replace("\n", "").strip()
 
 def strip_aim_prefix(s: str) -> str:
-    # AIM symbology prefixes look like ]Xn, e.g., ]C1, ]e0, ]d2
+    # FIXED: Properly strip AIM symbology prefixes, e.g., ]C1, ]e0, ]d2
     m = re.match(r'^\][A-Za-z]\d', s)
     return s[m.end():] if m else s
 
@@ -294,7 +294,7 @@ def get_remaining_for_pallet(pallet_id: str) -> Optional[int]:
     picked = safe_int(ss.picked_so_far.get(pallet_id, 0), 0)
     return clamp_nonneg(start - picked)
 
-# -------------------- LOOKUP (same as v1.8) --------------------
+# -------------------- LOOKUP --------------------
 def _auto_guess_cols(columns: List[str]) -> Dict[str, Optional[str]]:
     cols_lower = {c.lower(): c for c in columns}
     def pick(syns: List[str]) -> Optional[str]:
@@ -374,7 +374,7 @@ def lookup_fields_by_pallet(df, colmap: Dict[str, Optional[str]], pallet_id: str
         pass
     return out
 
-# -------------------- SCAN PARSERS (same as v1.8) --------------------
+# -------------------- SCAN PARSERS --------------------
 def try_parse_json(s: str) -> Optional[Dict[str,str]]:
     try:
         obj = json.loads(s); return obj if isinstance(obj, dict) else None
@@ -408,7 +408,7 @@ def try_parse_label_kv(s: str) -> Optional[Dict[str,str]]:
     return out or None
 
 def try_parse_label_compact(s: str) -> Optional[Dict[str,str]]:
-    tokens = re.split(r"[,\\s;]+", s.strip())
+    tokens = re.split(r"[,\\\s;]+", s.strip())
     out = {}
     i = 0
     while i < len(tokens) - 1:
@@ -420,7 +420,7 @@ def try_parse_label_compact(s: str) -> Optional[Dict[str,str]]:
     return out or None
 
 def try_parse_gs1_paren(s: str) -> Optional[Dict[str,str]]:
-    pairs = re.findall(r"\((\d{2,4})\)([^()]+)", s)
+    pairs = re.findall(r"\((\d{2,4})\)\([^\(\)]+\)", s)
     if not pairs:
         return None
     out: Dict[str,str] = {}
@@ -437,7 +437,6 @@ def try_parse_gs1_paren(s: str) -> Optional[Dict[str,str]]:
         elif ai in {"240","241"}:
             out["pallet"] = val
     return out or None
-
 def try_parse_gs1_fnc1(s: str) -> Optional[Dict[str,str]]:
     GS = "\x1D"
     if GS not in s and not re.match(r"^\d{2,4}", s):
@@ -536,7 +535,7 @@ def parse_any_scan(raw_code: str) -> Dict[str,str]:
 # -------------------- I18N --------------------
 LANGS = {
     "en": {
-        "build": "BUILD: outbound-batch v1.9.1 (Picker on main • UI • Guards • Offline • Voice • i18n)",
+        "build": "BUILD: outbound-batch v1.9.3 (Picker main • UI order • Guards • Offline • Voice • i18n)",
         "picker_required": "Picker Name (required)",
         "tz_label": "Timezone (IANA)",
         "time_now": "Current app time",
@@ -606,7 +605,7 @@ LANGS = {
         "status_bar_err": "⛔ Error",
     },
     "es": {
-        "build": "BUILD: v1.9.1 (Nombre del Picker en principal • UI • Reglas • Offline • Voz • i18n)",
+        "build": "BUILD: v1.9.3 (Picker principal • Orden UI • Reglas • Offline • Voz • i18n)",
         "picker_required": "Nombre del Picker (requerido)",
         "tz_label": "Zona horaria (IANA)",
         "time_now": "Hora actual de la app",
@@ -689,7 +688,6 @@ def _voice(text: str):
     """Lightweight TTS via Web Speech API (if enabled)."""
     if not CFG.get("voice_feedback"):
         return
-    # Escape simple quotes and newlines
     txt = (text or "").replace("\\", "\\\\").replace("`","").replace("\n", " ").replace("'", "\\'")
     st.markdown(f"""
 <script>
@@ -720,7 +718,6 @@ with st.sidebar:
         CFG["voice_feedback"] = st.toggle(_t("voice_toggle"), value=CFG.get("voice_feedback", False))
 
     st.markdown("### ⚙️ Settings")
-    # NOTE: Picker input REMOVED from sidebar; now on main panel per v1.9.1
     CFG["timezone"] = st.text_input(_t("tz_label"), value=CFG.get("timezone") or "America/Chicago")
     st.caption(f"{_t('time_now')}: {ts12()} (TZ: {CFG['timezone'] or 'system'})")
     st.write("**Log file:**", f"`{LOG_FILE}`")
@@ -734,16 +731,16 @@ with st.sidebar:
     pend = len(_pending_files())
     if pend:
         st.warning(f"{_t('pending_q')}: **{pend}**", icon="📥")
-        if st.button(_t("retry_now"), use_container_width=True, disabled=pend==0 or not WEBHOOK_URL):
-            sent, failed = _retry_pending(WEBHOOK_URL)
-            st.toast(_t("retry_result", sent=sent, failed=failed), icon="🔁")
-
-# Auto retry once per session if enabled via Secrets/Env
-if CFG.get("retry_pending_on_start") and WEBHOOK_URL and not ss.retried_on_start:
-    sent, failed = _retry_pending(WEBHOOK_URL)
-    ss.retried_on_start = True
-    if sent or failed:
+    if st.button(_t("retry_now"), use_container_width=True, disabled=pend==0 or not WEBHOOK_URL):
+        sent, failed = _retry_pending(WEBHOOK_URL)
         st.toast(_t("retry_result", sent=sent, failed=failed), icon="🔁")
+
+    # Auto retry once per session if enabled
+    if CFG.get("retry_pending_on_start") and WEBHOOK_URL and not ss.retried_on_start:
+        sent, failed = _retry_pending(WEBHOOK_URL)
+        ss.retried_on_start = True
+        if sent or failed:
+            st.toast(_t("retry_result", sent=sent, failed=failed), icon="🔁")
 
     st.markdown("---")
     st.markdown(f"#### #### {_t('inv_lookup')}")
@@ -755,7 +752,6 @@ if CFG.get("retry_pending_on_start") and WEBHOOK_URL and not ss.retried_on_start
         current_source_note = f"Using saved lookup: `{persisted_path}`"
     else:
         current_source_note = "No saved lookup yet."
-
     uploaded = st.file_uploader(_t("upload_label"), type=["csv","xlsx","xls"], accept_multiple_files=False)
     cols_btn = st.columns([1,1,1])
     with cols_btn[0]:
@@ -800,7 +796,6 @@ if CFG.get("retry_pending_on_start") and WEBHOOK_URL and not ss.retried_on_start
 
     saved_meta = _read_lookup_meta()
     saved_colmap = saved_meta.get("colmap") if isinstance(saved_meta.get("colmap"), dict) else {}
-
     if ss.lookup_df is not None:
         st.success(f"Loaded lookup with {len(ss.lookup_df):,} rows")
         cols = list(ss.lookup_df.columns)
@@ -824,7 +819,6 @@ if CFG.get("retry_pending_on_start") and WEBHOOK_URL and not ss.retried_on_start
             ss.lookup_cols["lot"] = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g.get("lot")) + 1) if g.get("lot") in cols else 0)
             ss.lookup_cols["location"] = st.selectbox("Location column", options=["(none)"] + cols, index=(cols.index(g.get("location")) + 1) if g.get("location") in cols else 0)
             ss.lookup_cols["qty"] = st.selectbox("Pallet QTY column", options=["(none)"] + cols, index=(cols.index(g.get("qty")) + 1) if g.get("qty") in cols else 0)
-
         for k in ["sku","lot","location","qty"]:
             if ss.lookup_cols.get(k) == "(none)":
                 ss.lookup_cols[k] = None
@@ -850,7 +844,6 @@ if CFG.get("retry_pending_on_start") and WEBHOOK_URL and not ss.retried_on_start
         min_value=0, step=1, value=ss.starting_qty or 0, help=_t("start_qty_hint")
     )
     st.caption("Max per line remains 15 cases.")
-
     if CFG["kiosk"]:
         st.caption(_t("kiosk_on"))
 
@@ -868,19 +861,24 @@ if CFG.get("retry_pending_on_start") and WEBHOOK_URL and not ss.retried_on_start
             "pending": _pending_files(),
         })
 
-    if CFG["kiosk"]:
-        st.markdown("", unsafe_allow_html=True)
-
 # -------------------- HEADER --------------------
 st.title("📦 Picking Helper — Outbound (Batch)")
-st.caption("Scan Pallet → KPI shows Pallet QTY → QTY Picked (max 15, not above Remaining) → (optional) Staging → Add to Batch → Review & Submit")
+st.caption("Picker → Scan Pallet → QTY Picked (max 15, not above Remaining) → Staging → Add to Batch → Review & Submit")
 
 def _focus_first_text():
-    st.markdown("""
-""", unsafe_allow_html=True)
+    # (Optional) Could implement focusing the first input if needed.
+    pass
 
 def _focus_qty_input():
+    # Light auto-focus on QTY box by placeholder match
     st.markdown("""
+<script>
+try {
+  const inputs = Array.from(parent.document.querySelectorAll('input'));
+  const qty = inputs.find(i => (i.getAttribute('placeholder')||'').includes('e.g., 5'));
+  if (qty) { qty.focus(); qty.select(); }
+} catch (e) {}
+</script>
 """, unsafe_allow_html=True)
 
 # -------------------- SAFE PRE-CLEAR BEFORE UI --------------------
@@ -899,7 +897,7 @@ if ss.clear_qty_next:
     st.session_state["qty_picked_str"] = ""
 _focus_first_text()
 
-# -------------------- Pallet + Staging Helpers --------------------
+# -------------------- Pallet & Staging Helpers --------------------
 def _apply_lookup_into_state(pallet_id: str):
     if ss.lookup_df is None:
         if ss.starting_qty and pallet_id:
@@ -929,6 +927,11 @@ def _apply_lookup_into_state(pallet_id: str):
         ss.start_qty_by_pallet[pallet_id] = ss.pallet_qty
 
 def on_pallet_scan():
+    # Gate scan by Picker requirement
+    if not ss.get("operator"):
+        st.warning("Enter the Picker Name above to begin.", icon="👆")
+        ss.scan = ""
+        return
     raw = ss.scan or ""; code = clean_scan(raw)
     if not code:
         return
@@ -943,7 +946,6 @@ def on_pallet_scan():
     if norm.get("lot") is not None:
         ss.lot_number = norm.get("lot") or ""
     _apply_lookup_into_state(pallet_id)
-
     bits = [f"Pallet {ss.current_pallet}"]
     if ss.pallet_qty is not None:
         bits.append(f"QTY {ss.pallet_qty}")
@@ -953,13 +955,11 @@ def on_pallet_scan():
         bits.append(f"SKU {ss.sku}")
     if ss.lot_number:
         bits.append(f"LOT {ss.lot_number}")
-
     rem_now = get_remaining_for_pallet(ss.current_pallet)
     if rem_now is not None and rem_now <= 0:
         st.toast(_t("pallet_full"), icon="✅"); _voice(_t("pallet_full"))
     else:
         st.toast("\n".join(bits), icon="✅")
-
     ss.recent_scans.insert(0, (now_local().strftime("%I:%M:%S %p"), strip_aim_prefix(code)))
     ss.recent_scans = ss.recent_scans[:25]
     ss.scan = ""; ss.focus_qty = True
@@ -979,7 +979,9 @@ def set_typed_staging():
     ss.staging_location_current = val
     st.toast(f"Staging Location set: {val}", icon="✍️")
 
-# -------------------- MAIN PANEL: Picker (FIRST), then Pallet Scan --------------------
+# -------------------- MAIN PANEL IN YOUR ORDER --------------------
+
+# 1) Picker Name
 st.subheader(_t("picker_required"))
 st.text_input(
     _t("picker_required"),
@@ -990,6 +992,15 @@ st.text_input(
 )
 if not ss.get("operator"):
     st.warning("Enter the Picker Name above to begin.", icon="👆")
+
+# 2) Scan Pallet ID
+st.subheader(_t("pallet_id"))
+st.text_input(
+    _t("scan_pallet_here"),
+    key="scan",
+    placeholder="Scan pallet barcode here",
+    on_change=on_pallet_scan
+)
 
 with st.expander(_t("raw_debug"), expanded=False):
     if ss.last_raw_scan:
@@ -1007,15 +1018,7 @@ with st.expander(_t("raw_debug"), expanded=False):
     else:
         st.caption("No raw pallet scan captured yet.")
 
-st.subheader(_t("staging_loc"))
-cS1, cS2 = st.columns([2, 1])
-with cS1:
-    st.text_input(_t("scan_staging_here"), key="staging_scan", placeholder="e.g., STAGE-01", on_change=on_staging_scan)
-with cS2:
-    st.text_input(_t("type_staging"), key="typed_staging", placeholder="e.g., STAGE-01")
-st.button(_t("set_staging"), on_click=set_typed_staging, use_container_width=True)
-
-# -------------------- KPI / Metrics --------------------
+# KPI / Metrics
 st.markdown("---")
 c1, c2, c3, c4, c5 = st.columns(5)
 with c1:
@@ -1028,16 +1031,6 @@ with c4:
     st.metric(_t("lot_number"), ss.lot_number or "—")
 with c5:
     st.metric(_t("source_location"), ss.current_location or "—")
-
-# --- Pallet Scan (added in v1.9.2) ------------------------------------------
-st.subheader(_t("pallet_id"))
-st.text_input(
-    _t("scan_pallet_here"),
-    key="scan",
-    placeholder="Scan pallet barcode here",
-    on_change=on_pallet_scan
-)
-
 c6, c7 = st.columns(2)
 with c6:
     st.metric(_t("pallet_qty"), "—" if ss.pallet_qty is None else safe_int(ss.pallet_qty, 0))
@@ -1045,7 +1038,26 @@ with c7:
     rem = get_remaining_for_pallet(ss.current_pallet) if ss.current_pallet else None
     st.metric(_t("remaining"), "—" if rem is None else rem)
 
-# -------------------- Status chip (color-coded readiness) --------------------
+# Floating batch summary
+total_lines = len(ss.batch_rows)
+total_qty = sum(safe_int(r.get("qty_staged"),0) for r in ss.batch_rows)
+st.markdown(f"""
+**{_t('batch_totals')}** — {_t('total_lines_cases', lines=total_lines, cases=total_qty)}
+Cap: {int(CFG.get('batch_max_qty',200))} cases
+""", unsafe_allow_html=True)
+st.markdown("---")
+
+# 3) QTY Picked
+st.subheader(_t("qty_picked"))
+qty_str = st.text_input(
+    _t("enter_qty"),
+    key="qty_picked_str",
+    placeholder="e.g., 5",
+    help="Max 15; not above Remaining or batch cap."
+)
+ss.qty_staged = safe_int(qty_str, 0)
+
+# Status chip (color-coded readiness)
 missing = []
 if not ss.operator:
     missing.append(_t("picker_name"))
@@ -1057,46 +1069,18 @@ if CFG["require_location"] and not ss.current_location:
     missing.append(_t("source_location"))
 if CFG["require_staging"] and not ss.staging_location_current:
     missing.append(_t("staging_loc"))
-
 if not missing:
-    st.markdown(f"""
-{_t('status_bar_ready')} — {_t('status_ready')}
-""", unsafe_allow_html=True)
+    st.markdown(f"{_t('status_bar_ready')} — {_t('status_ready')}", unsafe_allow_html=True)
 else:
-    st.markdown(f"""
-{_t('status_bar_warn')} — {_t('status_warn', fields=", ".join(missing))}
-""", unsafe_allow_html=True)
+    st.markdown(f"{_t('status_bar_warn')} — {_t('status_warn', fields=', '.join(missing))}", unsafe_allow_html=True)
 
-# Floating batch summary (always visible)
-total_lines = len(ss.batch_rows)
-total_qty = sum(safe_int(r.get("qty_staged"),0) for r in ss.batch_rows)
-st.markdown(f"""
-**{_t('batch_totals')}** — {_t('total_lines_cases', lines=total_lines, cases=total_qty)}
-Cap: {int(CFG.get('batch_max_qty',200))} cases
-""", unsafe_allow_html=True)
-st.markdown("---")
-
-# -------------------- QTY Picked + Batch controls --------------------
-st.subheader(_t("qty_picked"))
-qty_str = st.text_input(
-    _t("enter_qty"),
-    key="qty_picked_str",
-    placeholder="e.g., 5",
-    help="Max 15; not above Remaining or batch cap."
-)
-ss.qty_staged = safe_int(qty_str, 0)
-
-# Disable add if fully picked
+# Add/Undo/Download/Clear (top controls)
 _current_start = get_start_qty(ss.current_pallet)
 _current_remaining = get_remaining_for_pallet(ss.current_pallet) if _current_start is not None else None
-disable_add = (not bool(ss.operator)) or (
-    _current_start is not None and _current_remaining is not None and _current_remaining <= 0
-)
-
+disable_add = (not bool(ss.operator)) or (_current_start is not None and _current_remaining is not None and _current_remaining <= 0)
 if ss.focus_qty:
     _focus_qty_input(); ss.focus_qty = False
 
-# --- Add/Undo/Download/Clear row (top controls)
 colA, colC, colD, colE = st.columns([1,1,1,1])
 with colA:
     add_to_batch_click = st.button(_t("add_batch"), use_container_width=True, disabled=disable_add, key="add_top")
@@ -1130,7 +1114,7 @@ def _merge_duplicate_if_any(line: Dict) -> bool:
     for existing in reversed(ss.batch_rows):
         if existing.get("pallet_id","") == p and existing.get("staging_location","") == stg:
             new_q = safe_int(existing.get("qty_staged"),0) + safe_int(line.get("qty_staged"),0)
-            # keep per-line cap 15 as UI rule; if over 15, split across lines (simple: clip and leave remainder)
+            # keep per-line cap 15 as UI rule; if over 15, split across lines (clip and remainder)
             if new_q <= 15:
                 existing["qty_staged"] = new_q
                 existing["timestamp"] = line.get("timestamp", existing.get("timestamp"))
@@ -1154,13 +1138,11 @@ def _add_current_line_to_batch():
         st.error(_t("need_location")); _voice(_t("need_location")); return False
     if CFG["require_staging"] and not ss.staging_location_current:
         st.error(_t("need_staging")); _voice(_t("need_staging")); return False
-
     q = safe_int(ss.qty_staged, 0)
     if q <= 0:
         st.error(_t("need_qty")); _voice(_t("need_qty")); return False
     if q > 15:
         st.warning(_t("cap15")); q = 15
-
     # remaining cap per pallet
     start_qty = get_start_qty(ss.current_pallet)
     if start_qty is not None:
@@ -1169,14 +1151,12 @@ def _add_current_line_to_batch():
             st.error(_t("pallet_fully_picked", pallet=ss.current_pallet)); _voice(_t("pallet_fully_picked", pallet=ss.current_pallet)); return False
         if q > remaining_before:
             st.warning(_t("exceeds_remaining", qty=q, rem=remaining_before)); q = remaining_before
-
     # global batch cap
     q, cap_msg = _apply_global_cap_on_add(q)
     if cap_msg is not None:
         st.warning(cap_msg)
     if q <= 0:
         return False
-
     # Apply
     upsert_picked(ss.current_pallet, q)
     line = {
@@ -1223,6 +1203,16 @@ if undo_last:
             upsert_picked(row.get("pallet_id",""), safe_int(row.get("qty_staged"),0))
             st.success(f"Restored line for pallet {row.get('pallet_id','?')}.")
 
+# 4) Staging Location (LAST, as requested)
+st.markdown("---")
+st.subheader(_t("staging_loc"))
+cS1, cS2 = st.columns([2, 1])
+with cS1:
+    st.text_input(_t("scan_staging_here"), key="staging_scan", placeholder="e.g., STAGE-01", on_change=on_staging_scan)
+with cS2:
+    st.text_input(_t("type_staging"), key="typed_staging", placeholder="e.g., STAGE-01")
+st.button(_t("set_staging"), on_click=set_typed_staging, use_container_width=True)
+
 # -------------------- REVIEW & SUBMIT --------------------
 st.markdown("---")
 st.subheader(_t("review_submit"))
@@ -1244,13 +1234,11 @@ else:
             return max(safe_int(row["start_qty"],0) - safe_int(row["cum_staged"],0), 0)
         df["remaining_qty"] = df.apply(rem_after, axis=1)
         df["picker_name"] = ss.operator or ""
-
         view_cols = [
             "picker_name","source_location","staging_location","pallet_id",
             "sku","lot_number","qty_staged","remaining_qty","timestamp",
         ]
         df_view = df[view_cols].copy()
-
         op_col1, op_col2 = st.columns([1,3])
         with op_col1:
             st.metric(_t("picker_name"), ss.operator or "—")
@@ -1258,7 +1246,6 @@ else:
             total_lines = len(df_view)
             total_qty = int(df["qty_staged"].sum())
             st.metric(_t("batch_totals"), _t("total_lines_cases", lines=total_lines, cases=total_qty))
-
         st.caption("Edit QTY or fields (0-qty rows are dropped). **Capped at Remaining & batch cap**. Then **Apply Edits** → **Submit All**.")
         edited = st.data_editor(
             df_view,
@@ -1278,13 +1265,11 @@ else:
             num_rows="fixed",
             key="batch_editor"
         )
-
         colR1, colR2 = st.columns([1,1])
         with colR1:
             apply_edits = st.button(_t("apply_edits"), use_container_width=True, key="apply_top")
         with colR2:
             submit_all = st.button(_t("submit_all"), use_container_width=True, disabled=(not bool(ss.operator)), key="submit_top")
-
         # Honor bottom-bar trigger too
         submit_all = submit_all or st.session_state.pop("__submit_request", False)
 
@@ -1315,7 +1300,6 @@ else:
                         warn_msgs.append(f"Pallet {pallet}: qty {qty} > Remaining {remaining_here} — using {remaining_here}.")
                         qty = remaining_here
                     running_totals[pallet] = used + qty
-
                 # batch cap
                 if current_sum + qty > batch_cap:
                     allowed = max(batch_cap - current_sum, 0)
@@ -1325,7 +1309,6 @@ else:
                     warn_msgs.append(f"Global cap: using {allowed} instead of {qty}.")
                     qty = allowed
                 current_sum += qty
-
                 new_rows.append({
                     "order_number": "",
                     "source_location": str(r.get("source_location","")),
@@ -1336,7 +1319,6 @@ else:
                     "qty_staged": qty,
                     "timestamp": str(r.get("timestamp","")),
                 })
-
             ss.picked_so_far = {}
             for row in new_rows:
                 upsert_picked(row.get("pallet_id",""), safe_int(row.get("qty_staged"),0))
@@ -1388,7 +1370,6 @@ else:
                             send_error = str(e)
                             _queue_submission(payload, batch_id)  # offline queue
                     else:
-                        # If no webhook, still store for history
                         _queue_submission(payload, batch_id)
 
                     if TEAMS_WEBHOOK_URL:
@@ -1432,12 +1413,12 @@ else:
                             json.dump(payload, jf, ensure_ascii=False, indent=2)
                     except Exception:
                         pass
+
                     if WEBHOOK_URL and not sent_ok:
                         st.error(f"Submit saved locally; webhook failed and was queued: {send_error}")
                         _voice("Submission queued for retry")
                     else:
                         st.success(_t("submit_ok")); _voice("Submitted")
-
                     ss.batch_rows = []
                     st.toast(
                         f"Batch {batch_id} — {payload['totals']['lines']} lines / {payload['totals']['qty_staged_sum']} cases.",
@@ -1493,11 +1474,9 @@ if undo_bottom:
             ss.batch_rows.append(row)
             upsert_picked(row.get("pallet_id",""), safe_int(row.get("qty_staged"),0))
             st.success(f"Restored line for pallet {row.get('pallet_id','?')}.")
-
 if submit_bottom:
     st.session_state["__submit_request"] = True  # neutral flag, not a widget key
     st.rerun()
-
 if clear_bottom:
     if ss.batch_rows:
         for r in ss.batch_rows:
