@@ -992,15 +992,16 @@ ss["operator"] = st.text_input(
 if not ss.operator:
     st.warning("Enter the Picker Name above to begin.", icon="👆")
 
-st.subheader(_t("pallet_id"))
+st.subheader(_t("picker_required"))
 st.text_input(
-    _t("scan_pallet_here"),
-    key="scan",
-    placeholder="GS1/AIM/JSON/query/label parsed",
-    on_change=on_pallet_scan,
-    disabled=not bool(ss.operator)  # Gate scanning until picker is set
+    _t("picker_required"),
+    key="operator",
+    value=ss.operator,
+    placeholder="e.g., Carlos",
+    help="Required before scanning pallets. Used on notifications and CSV logs."
 )
-
+if not ss.operator:
+    st.warning("Enter the Picker Name above to begin.", icon="👆")
 with st.expander(_t("raw_debug"), expanded=False):
     if ss.last_raw_scan:
         raw = ss.last_raw_scan
