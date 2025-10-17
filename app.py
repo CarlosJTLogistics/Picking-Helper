@@ -1,11 +1,5 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.5.1 — KPI shows Pallet QTY (from lookup) + live Remaining; Operator shown in Review & Submit;
-#           stronger parameter guards; builds on v1.5 (scan-only UI, Secrets-first, Scan-to-Add, Undo).
-#
-# Key behaviors:
-# - Scan Pallet → auto-fill (Pallet, SKU, LOT, Location) via scan+lookup → KPI shows Pallet QTY and Remaining.
-# - Enter QTY staged (1–15); (optional) scan/type Staging; Add to Batch → Remaining reduces accordingly.
-# - Operator name is visible in Review & Submit; included in payload/logs as before.
+# v1.5.2 — Defaults for lookup columns; Review & Submit shows Picker Name + Remaining QTY; keeps KPI pallet qty & guards.
 
 import os
 import io
@@ -76,29 +70,28 @@ ss = st.session_state
 defaults = {
     "operator": "",
     "current_order": "",
-    "current_location": "",     # auto-filled (read-only to operator)
+    "current_location": "",
     "current_pallet": "",
     "sku": "",
     "lot_number": "",
     "staging_location_current": "",
-    "scan": "",                 # pallet scan
-    "staging_scan": "",         # staging scan
-    "typed_staging": "",        # staging typed
+    "scan": "",
+    "staging_scan": "",
+    "typed_staging": "",
     "qty_staged": 0,
-    "starting_qty": None,       # legacy single value (we still honor for display)
-    "picked_so_far": {},        # pallet_id -> int
+    "starting_qty": None,
+    "picked_so_far": {},
     "recent_scans": [],
     "last_raw_scan": "",
     "focus_qty": False,
     "lookup_df": None,
-    "lookup_cols": {"pallet": None, "sku": None, "lot": None, "location": None, "qty": None},  # v1.5.1 add qty
+    "lookup_cols": {"pallet": None, "sku": None, "lot": None, "location": None, "qty": None},
     "batch_rows": [],
     "undo_stack": [],
     "redo_stack": [],
     "tag_bytes": None,
-    # v1.5.1 — store per-pallet starting qty & current pallet qty for KPI/Remaining
-    "start_qty_by_pallet": {},  # dict: pallet_id -> int
-    "pallet_qty": None,         # current pallet qty for KPI
+    "start_qty_by_pallet": {},  # pallet_id -> int
+    "pallet_qty": None,         # KPI value for current pallet
 }
 for k, v in defaults.items():
     if k not in ss:
@@ -119,7 +112,6 @@ def safe_int(x, default=0) -> int:
             return int(x)
         s = str(x).strip()
         if s == "": return default
-        # Extract digits (allow negatives if needed; here we clamp to >=0 later)
         s2 = re.sub(r"[^\d\-]", "", s)
         return int(s2) if s2 not in ("","-") else default
     except Exception:
@@ -175,12 +167,10 @@ def upsert_picked(pallet_id: str, qty: int):
     ss.picked_so_far[pallet_id] = ss.picked_so_far.get(pallet_id, 0) + max(safe_int(qty,0),0)
 
 def get_start_qty(pallet_id: str) -> Optional[int]:
-    # v1.5.1 — prefer per‑pallet start qty if available
     if not pallet_id:
         return None
     if pallet_id in ss.start_qty_by_pallet:
         return safe_int(ss.start_qty_by_pallet[pallet_id], 0)
-    # fallback to single starting_qty if the current pallet matches
     if pallet_id == ss.current_pallet and ss.starting_qty not in (None, 0):
         return safe_int(ss.starting_qty, 0)
     return None
@@ -215,7 +205,6 @@ def _auto_guess_cols(columns: List[str]) -> Dict[str, Optional[str]]:
         "sku":      pick(["sku","item","itemcode","product","part","material"]),
         "lot":      pick(["lot","lot_number","lot #","lot#","batch","batchno"]),
         "location": pick(["location","loc","bin","slot","binlocation","location code","staging","stg"]),
-        # v1.5.1: auto-detect qty column
         "qty":      pick(["qty","quantity","cases","casecount","count","units","pallet_qty","onhand","on_hand"]),
     }
 
@@ -273,14 +262,13 @@ def lookup_fields_by_pallet(df, colmap: Dict[str, Optional[str]], pallet_id: str
                 out["lot"] = normalize_lot(row[c])
             if (c := colmap.get("location")) and c in df.columns:
                 out["location"] = str(row[c]).strip()
-            # v1.5.1: qty on pallet
             if (c := colmap.get("qty")) and c in df.columns:
                 out["pallet_qty"] = str(row[c]).strip()
     except Exception:
         pass
     return out
 
-# ------------------ SCAN PARSERS (same as v1.5) ------------------
+# ------------------ SCAN PARSERS (AIM/GS1 + label + kv) ------------------
 def try_parse_json(s: str) -> Optional[Dict[str,str]]:
     try:
         obj = json.loads(s)
@@ -407,7 +395,6 @@ def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
         "pallet":   ["pallet","pallet_id","pallet id","serial","id","license","lpn","sscc"],
         "sku":      ["sku","item","itemcode","product","part","material"],
         "lot":      ["lot","lot_number","lot #","lot#","batch","batchno"],
-        # qty not typically in scans; comes from lookup
     }
     out: Dict[str,str] = {}
     lower_data = {k.lower(): str(v) for k, v in data.items()}
@@ -443,7 +430,7 @@ def parse_any_scan(raw_code: str) -> Dict[str,str]:
 
 # ------------------ SIDEBAR ------------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.5.1 (KPI Pallet QTY + Remaining; Operator in Review; guards)", icon="🧭")
+    st.info("BUILD: outbound-batch v1.5.2 (defaults + Picker Name + Remaining QTY)", icon="🧭")
     st.caption(f"Config source: **{CFG['_source']}**")
     st.markdown("### ⚙️ Settings")
     ss["operator"] = st.text_input("Operator (optional)", value=ss.operator, placeholder="e.g., Carlos")
@@ -473,16 +460,30 @@ with st.sidebar:
     if ss.lookup_df is not None:
         st.success(f"Loaded lookup with {len(ss.lookup_df):,} rows")
         cols = list(ss.lookup_df.columns)
+
+        # ----- Defaults you requested -----
+        desired_defaults = {
+            "pallet":   "PalletID",
+            "lot":      "CustomerLot Reference",
+            "sku":      "WarehouseSku",
+            "location": "LocationName",
+            "qty":      "QTY On Hand",
+        }
+        # If exact names exist, prefer them; else fall back to guessed
         g = guessed or {"pallet": None, "sku": None, "lot": None, "location": None, "qty": None}
+        for key, want in desired_defaults.items():
+            if want in cols:
+                g[key] = want
+
         c1, c2 = st.columns(2)
         with c1:
-            ss.lookup_cols["pallet"]   = st.selectbox("Pallet column", options=cols, index=cols.index(g["pallet"]) if g.get("pallet") in cols else 0)
-            ss.lookup_cols["sku"]      = st.selectbox("SKU column", options=["(none)"] + cols, index=(cols.index(g["sku"]) + 1) if g.get("sku") in cols else 0)
+            ss.lookup_cols["pallet"]   = st.selectbox("Pallet column", options=cols, index=cols.index(g.get("pallet")) if g.get("pallet") in cols else 0)
+            ss.lookup_cols["sku"]      = st.selectbox("SKU column", options=["(none)"] + cols, index=(cols.index(g.get("sku")) + 1) if g.get("sku") in cols else 0)
         with c2:
-            ss.lookup_cols["lot"]      = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g["lot"]) + 1) if g.get("lot") in cols else 0)
-            ss.lookup_cols["location"] = st.selectbox("Location column", options=["(none)"] + cols, index=(cols.index(g["location"]) + 1) if g.get("location") in cols else 0)
-        # v1.5.1 qty column picker
-        ss.lookup_cols["qty"] = st.selectbox("Pallet QTY column", options=["(none)"] + cols, index=(cols.index(g.get("qty")) + 1) if g and g.get("qty") in cols else 0)
+            ss.lookup_cols["lot"]      = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g.get("lot")) + 1) if g.get("lot") in cols else 0)
+            ss.lookup_cols["location"] = st.selectbox("Location column", options=["(none)"] + cols, index=(cols.index(g.get("location")) + 1) if g.get("location") in cols else 0)
+        ss.lookup_cols["qty"] = st.selectbox("Pallet QTY column", options=["(none)"] + cols, index=(cols.index(g.get("qty")) + 1) if g.get("qty") in cols else 0)
+
         for k in ["sku","lot","location","qty"]:
             if ss.lookup_cols.get(k) == "(none)":
                 ss.lookup_cols[k] = None
@@ -498,7 +499,7 @@ with st.sidebar:
     ss["starting_qty"] = st.number_input(
         "Starting qty on current pallet (fallback if lookup lacks qty)",
         min_value=0, step=1, value=ss.starting_qty or 0,
-        help="If your lookup provides pallet quantity, that value will override this for the KPI & Remaining."
+        help="If your lookup provides pallet quantity, that value will override this for KPI & Remaining."
     )
     st.caption("Max staged per line remains 15 cases (validation).")
     if KIOSK:
@@ -515,7 +516,6 @@ with st.sidebar:
             "files_in_cwd": sorted(os.listdir("."))[:50],
         })
 
-# Kiosk CSS
 if KIOSK:
     st.markdown("<style>#MainMenu, footer {visibility:hidden;}</style>", unsafe_allow_html=True)
 
@@ -557,7 +557,7 @@ def _apply_lookup_into_state(pallet_id: str):
         "sku": ss.lookup_cols.get("sku"),
         "lot": ss.lookup_cols.get("lot"),
         "location": ss.lookup_cols.get("location"),
-        "qty": ss.lookup_cols.get("qty"),  # v1.5.1
+        "qty": ss.lookup_cols.get("qty"),
     }
     looked = lookup_fields_by_pallet(ss.lookup_df, lookup_map, pallet_id)
     if looked.get("location"): ss.current_location = looked["location"]
@@ -567,7 +567,6 @@ def _apply_lookup_into_state(pallet_id: str):
         qty_val = clamp_nonneg(safe_int(looked.get("pallet_qty"), 0))
         ss.pallet_qty = qty_val
         ss.start_qty_by_pallet[pallet_id] = qty_val
-    # if no qty from lookup, consider sidebar fallback for current pallet
     elif ss.starting_qty and pallet_id:
         ss.pallet_qty = clamp_nonneg(safe_int(ss.starting_qty, 0))
         ss.start_qty_by_pallet[pallet_id] = ss.pallet_qty
@@ -578,17 +577,12 @@ def on_pallet_scan():
     if not code:
         return
     ss.last_raw_scan = raw
-
     norm = parse_any_scan(code)
-
     pallet_id = norm.get("pallet") or strip_aim_prefix(code) or code
     ss.current_pallet = pallet_id
-
-    # If scan provided fields, use them; then lookup complements
     if norm.get("location"): ss.current_location = norm["location"]
     if norm.get("sku") is not None: ss.sku = norm.get("sku") or ""
     if norm.get("lot") is not None: ss.lot_number = norm.get("lot") or ""
-
     _apply_lookup_into_state(pallet_id)
 
     bits = [f"Pallet {ss.current_pallet}"]
@@ -601,8 +595,7 @@ def on_pallet_scan():
     ss.recent_scans.insert(0, (datetime.now().strftime("%H:%M:%S"), strip_aim_prefix(code)))
     ss.recent_scans = ss.recent_scans[:25]
     ss.scan = ""
-
-    ss.focus_qty = True  # move cursor to QTY staged
+    ss.focus_qty = True
 
 def on_staging_scan():
     raw = ss.staging_scan or ""
@@ -612,8 +605,6 @@ def on_staging_scan():
     ss.staging_location_current = code
     st.toast(f"Staging Location set: {code}", icon="📍")
     ss.staging_scan = ""
-
-    # Scan-to-Add: if QTY present, auto-add
     if CFG["scan_to_add"] and ss.current_pallet and ss.qty_staged > 0:
         _add_current_line_to_batch()
 
@@ -657,15 +648,14 @@ with cS2:
 # ------------------ KPI / Metrics ------------------
 st.markdown("---")
 c1, c2, c3, c4, c5 = st.columns(5)
-with c1: st.metric("Operator", ss.operator or "—")  # v1.5.1: quick reference
+with c1: st.metric("Operator", ss.operator or "—")
 with c2: st.metric("Pallet ID", ss.current_pallet or "—")
 with c3: st.metric("SKU", ss.sku or "—")
 with c4: st.metric("LOT Number", ss.lot_number or "—")
 with c5: st.metric("Source Location", ss.current_location or "—")
 
 c6, c7 = st.columns(2)
-with c6:
-    st.metric("Pallet QTY", "—" if ss.pallet_qty is None else safe_int(ss.pallet_qty, 0))
+with c6: st.metric("Pallet QTY", "—" if ss.pallet_qty is None else safe_int(ss.pallet_qty, 0))
 with c7:
     rem = get_remaining_for_pallet(ss.current_pallet) if ss.current_pallet else None
     st.metric("Remaining", "—" if rem is None else rem)
@@ -714,7 +704,6 @@ with colE:
     clear_batch = st.button("🗑️ Clear Batch", use_container_width=True, disabled=not ss.batch_rows)
 
 def _add_current_line_to_batch():
-    # Guards
     if not ss.current_pallet:
         st.error("Scan a **Pallet ID** before adding.")
         return False
@@ -732,13 +721,12 @@ def _add_current_line_to_batch():
         st.warning("QTY staged capped at 15 cases per line.")
         q = 15
 
-    # Update picked tracker by staged qty (so Remaining drops immediately)
     upsert_picked(ss.current_pallet, q)
     if safe_int(pick_qty, 0) > 0:
         upsert_picked(ss.current_pallet, safe_int(pick_qty, 0))
 
     line = {
-        "order_number": ss.current_order or "",
+        "order_number": ss.current_order or "",  # kept for schema; not shown in UI
         "source_location": ss.current_location or "",
         "staging_location": ss.staging_location_current or "",
         "pallet_id": ss.current_pallet,
@@ -781,25 +769,20 @@ if ss.tag_bytes:
         mime="image/png"
     )
 
-# Undo logic
 if undo_last:
     if ss.batch_rows:
         last = ss.batch_rows.pop()
         ss.undo_stack.append(("remove", last))
-        # Reverse the picked_so_far impact
         upsert_picked(last.get("pallet_id",""), -safe_int(last.get("qty_staged"),0))
         st.warning(f"Removed last line for pallet {last.get('pallet_id','?')}. Click again to undo removal.", icon="↩")
     elif ss.undo_stack:
         act, row = ss.undo_stack.pop()
         if act == "remove":
             ss.batch_rows.append(row)
-            # Re-apply picked impact
             upsert_picked(row.get("pallet_id",""), safe_int(row.get("qty_staged"),0))
             st.success(f"Restored line for pallet {row.get('pallet_id','?')}.")
 
-# Clear batch
 if clear_batch and ss.batch_rows:
-    # Reverse picked_so_far for all cleared rows (guard)
     for r in ss.batch_rows:
         upsert_picked(r.get("pallet_id",""), -safe_int(r.get("qty_staged"),0))
     ss.undo_stack.append(("remove_all", ss.batch_rows.copy()))
@@ -814,37 +797,64 @@ if not ss.batch_rows:
 else:
     try:
         import pandas as pd
-        df_batch = pd.DataFrame(ss.batch_rows)
+        df = pd.DataFrame(ss.batch_rows)
     except Exception:
-        df_batch = None
-    if df_batch is not None:
-        # v1.5.1 — show operator prominently here
+        df = None
+    if df is not None and not df.empty:
+        # Compute per-row Remaining QTY (cumulative by pallet)
+        df["qty_staged"] = df["qty_staged"].apply(lambda x: max(safe_int(x,0),0))
+        # Map start qty per pallet
+        df["start_qty"] = df["pallet_id"].apply(lambda p: get_start_qty(p))
+        # Cumulative staged per pallet
+        df["cum_staged"] = df.groupby("pallet_id")["qty_staged"].cumsum()
+        # Remaining after this row
+        def rem_after(row):
+            if row["start_qty"] is None:
+                return None
+            return max(safe_int(row["start_qty"],0) - safe_int(row["cum_staged"],0), 0)
+        df["remaining_qty"] = df.apply(rem_after, axis=1)
+
+        # Inject Picker Name column (from Operator)
+        df["picker_name"] = ss.operator or ""
+
+        # Build the editor view without "order_number"
+        view_cols = [
+            "picker_name",      # replaces Order #
+            "source_location",
+            "staging_location",
+            "pallet_id",
+            "sku",
+            "lot_number",
+            "qty_staged",
+            "remaining_qty",    # new
+            "timestamp",
+        ]
+        df_view = df[view_cols].copy()
+
+        # Header metrics
         op_col1, op_col2 = st.columns([1,3])
         with op_col1:
             st.metric("Operator", ss.operator or "—")
         with op_col2:
-            try:
-                total_lines = len(df_batch)
-                total_qty = int(df_batch["qty_staged"].sum())
-            except Exception:
-                total_lines = len(ss.batch_rows)
-                total_qty = sum(safe_int(r.get("qty_staged", 0), 0) for r in ss.batch_rows)
+            total_lines = len(df_view)
+            total_qty = int(df["qty_staged"].sum())
             st.metric("Batch Totals", f"{total_lines} lines / {total_qty} cases")
 
         st.caption("Edit QTY or fields if needed (0-qty rows are dropped). Then **Apply Edits** → **Submit All**.")
         edited = st.data_editor(
-            df_batch,
+            df_view,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "order_number": "Order # (optional)",
+                "picker_name": st.column_config.TextColumn("Picker Name", disabled=True),
                 "source_location": "Source Location",
                 "staging_location": "Staging Location",
-                "pallet_id": "Pallet ID",
-                "sku": "SKU",
-                "lot_number": "LOT",
+                "pallet_id": st.column_config.TextColumn("Pallet ID", disabled=True),
+                "sku": st.column_config.TextColumn("SKU", disabled=True),
+                "lot_number": st.column_config.TextColumn("LOT", disabled=True),
                 "qty_staged": st.column_config.NumberColumn("QTY Staged", min_value=0, max_value=15),
-                "timestamp": "Timestamp",
+                "remaining_qty": st.column_config.NumberColumn("Remaining QTY", disabled=True),
+                "timestamp": st.column_config.TextColumn("Timestamp", disabled=True),
             },
             num_rows="fixed",
             key="batch_editor"
@@ -857,17 +867,19 @@ else:
             submit_all = st.button("✅ Submit All", use_container_width=True)
 
         if apply_edits:
+            # Map edits back to ss.batch_rows (ignore derived columns)
             new_rows = []
             for _, r in edited.iterrows():
                 qty = safe_int(r.get("qty_staged", 0), 0)
-                if qty <= 0:  # drop 0-qty lines
-                    # also reverse picked_so_far if original had qty (guard)
+                if qty <= 0:
                     continue
                 if qty > 15:
                     st.error(f"Line for pallet {r.get('pallet_id','?')}: qty {qty} > 15 (max). Using 15.")
                     qty = 15
+                # Find original row by pallet+timestamp to preserve values
+                # Fallback: rebuild with essentials from edited view
                 new_rows.append({
-                    "order_number": str(r.get("order_number","")),
+                    "order_number": ss.current_order or "",
                     "source_location": str(r.get("source_location","")),
                     "staging_location": str(r.get("staging_location","")),
                     "pallet_id": str(r.get("pallet_id","")),
@@ -876,7 +888,7 @@ else:
                     "qty_staged": qty,
                     "timestamp": str(r.get("timestamp","")),
                 })
-            # Recompute picked_so_far from scratch to avoid drift
+            # Recompute picked_so_far from scratch
             ss.picked_so_far = {}
             for row in new_rows:
                 upsert_picked(row.get("pallet_id",""), safe_int(row.get("qty_staged"),0))
@@ -887,7 +899,6 @@ else:
             if not ss.batch_rows:
                 st.error("Batch is empty.")
             else:
-                # Validate lines
                 bad = []
                 for r in ss.batch_rows:
                     if (CFG["require_location"] and not r.get("source_location")) or not r.get("pallet_id"):
@@ -911,7 +922,6 @@ else:
                         "totals": {"lines": len(ss.batch_rows), "qty_staged_sum": totals_qty},
                         "notify_to": NOTIFY_TO,
                     }
-                    # Webhook
                     sent_ok = False
                     send_error = None
                     if WEBHOOK_URL:
@@ -922,7 +932,7 @@ else:
                             sent_ok = True
                         except Exception as e:
                             send_error = str(e)
-                    # Log locally with remaining per line based on per‑pallet start qty
+                    # Log with remaining per line based on start qty and cumulative picked
                     for r in ss.batch_rows:
                         pal = r.get("pallet_id","")
                         start_qty = get_start_qty(pal)
@@ -931,20 +941,19 @@ else:
                         append_log_row({
                             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             "operator": ss.operator or "",
-                            "order_number": r.get("order_number",""),
+                            "order_number": "",  # deprecated visually; kept for schema
                             "location": r.get("source_location",""),
                             "staging_location": r.get("staging_location",""),
                             "pallet_id": pal,
                             "sku": r.get("sku",""),
                             "lot_number": r.get("lot_number",""),
                             "qty_staged": safe_int(r.get("qty_staged", 0), 0) or "",
-                            "qty_picked": "",  # optional, could mirror qty_staged if desired
+                            "qty_picked": "",  # leave blank or mirror qty_staged if you prefer
                             "starting_qty": (start_qty if start_qty is not None else ""),
                             "remaining_after": (remaining_after if remaining_after is not None else ""),
                             "batch_id": batch_id,
                             "action": "SUBMIT",
                         })
-                    # JSON backup
                     try:
                         with open(os.path.join(LOG_DIR, f"{batch_id}.json"), "w", encoding="utf-8") as jf:
                             json.dump(payload, jf, ensure_ascii=False, indent=2)
@@ -973,4 +982,4 @@ if os.path.exists(LOG_FILE):
     except Exception:
         st.code(open(LOG_FILE, "r", encoding="utf-8", errors="ignore").read().splitlines()[-10:])
 else:
-    st.info("No log entries yet today.")
+    st.info("No log entries yet today.")day.")
