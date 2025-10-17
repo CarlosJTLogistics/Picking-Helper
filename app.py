@@ -1388,7 +1388,6 @@ else:
                             requests.post(TEAMS_WEBHOOK_URL, json=card, timeout=10)
                         except Exception:
                             pass
-
                     # Write CSV log rows (12-hour local timestamps)
                     for r in ss.batch_rows:
                         pal = r.get("pallet_id","")
@@ -1416,7 +1415,6 @@ else:
                             json.dump(payload, jf, ensure_ascii=False, indent=2)
                     except Exception:
                         pass
-
                     if WEBHOOK_URL and not sent_ok:
                         st.error(f"Submit saved locally; webhook failed and was queued: {send_error}")
                         _voice("Submission queued for retry")
@@ -1489,4 +1487,4 @@ if clear_bottom:
             upsert_picked(r.get("pallet_id",""), -safe_int(r.get("qty_staged"),0))
         ss.undo_stack.append(("remove_all", ss.batch_rows.copy()))
         ss.batch_rows = []
-        st.warning("Batch cleared.")
+        st.warning("Batch cleared.")red.")
