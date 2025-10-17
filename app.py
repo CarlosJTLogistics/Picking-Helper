@@ -1,5 +1,5 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.4.3 — QR compatibility: GS1 FNC1, GS1 (paren), label-style, compact label; Raw Scan Debugger
+# v1.4.4 — Handle AIM prefix (e.g., ]C1), AI 240/241 as pallet (LPN), and GS1 "naked numeric" without FNC1
 import os
 import io
 import re
@@ -14,7 +14,6 @@ from datetime import datetime
 from pathlib import Path
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
-
 # ------------------ PAGE SETUP ------------------
 st.set_page_config(page_title="Picking Helper", page_icon="📦", layout="wide")
 
@@ -66,7 +65,7 @@ defaults = {
     "lookup_df": None,
     "lookup_cols": {"pallet": None, "sku": None, "lot": None, "location": None},
     "batch_rows": [],
-    "last_raw_scan": "",  # NEW: for debugger
+    "last_raw_scan": "",
 }
 for k, v in defaults.items():
     if k not in ss:
@@ -74,8 +73,16 @@ for k, v in defaults.items():
 
 # ------------------ HELPERS ------------------
 def clean_scan(raw: str) -> str:
-    # Preserve control chars like \x1D (GS1 FNC1); strip only CR/LF & outer spaces.
+    # Preserve control chars like \x1D (GS1 FNC1); strip only CR/LF & edges.
     return (raw or "").replace("\r", "").replace("\n", "").strip()
+
+def strip_aim_prefix(s: str) -> str:
+    """
+    Remove AIM Symbology Identifier prefixes like ]C1, ]Q3, ]d2, etc.
+    Pattern: ']' + 1 letter + 1 digit
+    """
+    m = re.match(r"^\][A-Za-z]\d", s)
+    return s[m.end():] if m else s
 
 def append_log_row(row: dict):
     file_exists = os.path.isfile(LOG_FILE)
@@ -219,7 +226,6 @@ def try_parse_json(s: str) -> Optional[Dict[str,str]]:
         return None
 
 def try_parse_query_or_kv(s: str) -> Optional[Dict[str,str]]:
-    # URL query or "k=v" separated by &, ;, commas, spaces, or newlines. Also accept "k: v".
     if "://" in s:
         parsed = urlparse(s)
         qs = parse_qs(parsed.query, keep_blank_values=True)
@@ -237,7 +243,6 @@ def try_parse_query_or_kv(s: str) -> Optional[Dict[str,str]]:
     return kv or None
 
 def try_parse_label_kv(s: str) -> Optional[Dict[str,str]]:
-    # Lines like "Pallet ID: JTL00496", "LOT: 9062716", "Location: 11400804"
     lines = re.split(r"[\n;,]+", s)
     out = {}
     for line in lines:
@@ -249,11 +254,6 @@ def try_parse_label_kv(s: str) -> Optional[Dict[str,str]]:
     return out or None
 
 def try_parse_label_compact(s: str) -> Optional[Dict[str,str]]:
-    """
-    Compact label style without clear separators, e.g.:
-      "LPN JTL00496 LOT 9062716 LOC 11400804"
-      "PALLET JTL00496, SKU 12345, LOT# 9062716, LOCATION 11400804"
-    """
     tokens = re.split(r"[,\s;]+", s.strip())
     out = {}
     i = 0
@@ -268,7 +268,6 @@ def try_parse_label_compact(s: str) -> Optional[Dict[str,str]]:
     return out or None
 
 def try_parse_gs1_paren(s: str) -> Optional[Dict[str,str]]:
-    # (01)GTIN(21)SERIAL(10)LOT
     pairs = re.findall(r"\((\d{2,4})\)([^()]+)", s)
     if not pairs:
         return None
@@ -278,68 +277,75 @@ def try_parse_gs1_paren(s: str) -> Optional[Dict[str,str]]:
         if ai == "21": out["pallet"] = val
         elif ai == "10": out["lot"] = val
         elif ai == "01": out["gtin"] = val
-        elif ai == "00": out["pallet"] = val  # SSCC as pallet if no 21
+        elif ai == "00": out["pallet"] = val
+        elif ai in {"240","241"}: out["pallet"] = val  # NEW: map 240/241 to pallet
     return out or None
 
 def try_parse_gs1_fnc1(s: str) -> Optional[Dict[str,str]]:
-    """
-    GS1 with FNC1 (ASCII 29) group separators.
-    Works for strings like: 010123456789012121JTL00496\x1D109062716
-    """
     GS = "\x1D"
-    # Quick gate: presence of FNC1 OR begins with digits (AI)
     if GS not in s and not re.match(r"^\d{2,4}", s):
         return None
-
-    AI_FIXED = {"00":18, "01":14}        # SSCC, GTIN
-    AI_VAR = {"10","21","240","241"}     # LOT, SERIAL/LPN, etc.
-
+    AI_FIXED = {"00":18, "01":14}
+    AI_VAR = {"10","21","240","241"}  # lot, serial/LPN, addl IDs
     i = 0
     n = len(s)
     out: Dict[str,str] = {}
-
     def read_ai(idx: int) -> Tuple[Optional[str], int]:
         for L in (4,3,2):
             if idx+L <= n and s[idx:idx+L].isdigit():
                 return s[idx:idx+L], idx+L
         return None, idx+1
-
     while i < n:
         if not s[i].isdigit():
-            i += 1
-            continue
+            i += 1; continue
         ai, j = read_ai(i)
         if not ai:
-            i += 1
-            continue
+            i += 1; continue
         if ai in AI_FIXED:
             L = AI_FIXED[ai]
-            if j+L <= n:
-                val = s[j:j+L]
-                i = j+L
-            else:
-                val = s[j:]
-                i = n
+            val = s[j:j+L] if j+L <= n else s[j:]; i = j+L if j+L <= n else n
         elif ai in AI_VAR:
             k = s.find(GS, j)
             if k == -1:
-                val = s[j:]
-                i = n
+                val = s[j:]; i = n
             else:
-                val = s[j:k]
-                i = k+1
+                val = s[j:k]; i = k+1
         else:
-            # Skip unknown AIs up to next GS
-            k = s.find(GS, j)
-            i = (k+1) if k != -1 else n
-            continue
-
+            k = s.find(GS, j); i = (k+1) if k != -1 else n; continue
         val = val.strip()
-        if ai == "21": out["pallet"] = val
-        elif ai == "10": out["lot"] = val
-        elif ai == "01": out["gtin"] = val
-        elif ai == "00": out["pallet"] = val  # SSCC
+        if ai in {"21","00","240","241"}:
+            out["pallet"] = val
+        elif ai == "10":
+            out["lot"] = val
+        elif ai == "01":
+            out["gtin"] = val
     return out or None
+
+def try_parse_gs1_numeric_naked(s: str) -> Optional[Dict[str,str]]:
+    """
+    Handles GS1 data that starts directly with AIs but *no* FNC1 and *no* parentheses,
+    e.g., "2408304174125" (single AI 240 with rest of string as value).
+    """
+    if not re.match(r"^\d{2,4}", s):
+        return None
+    out: Dict[str,str] = {}
+    # Only robust when there's effectively a single AI or fixed-length first AI.
+    # Handle common first AIs explicitly:
+    if s.startswith("00") and len(s) >= 20:   # 00 + 18
+        out["pallet"] = s[2:20]
+    elif s.startswith("01") and len(s) >= 16: # 01 + 14
+        out["gtin"] = s[2:16]
+    elif s.startswith(("21","10","240","241")):
+        # Variable-length: take the remainder
+        val = s[2:] if s.startswith(("21","10")) else s[3:]
+        ai = s[:2] if s.startswith(("21","10")) else s[:3]
+        val = val.strip()
+        if ai in {"21","240","241"} and val:
+            out["pallet"] = val
+        elif ai == "10" and val:
+            out["lot"] = val
+    return out or None
+
 def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
     key_map = {
         "location": ["location","loc","bin","slot","staging","stg","binlocation","location code"],
@@ -358,9 +364,19 @@ def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
         out["lot"] = normalize_lot(out["lot"])
     return out
 
-def parse_any_scan(code: str) -> Dict[str,str]:
-    # Order matters: try structured → GS1 → label styles
-    for fn in (try_parse_json, try_parse_query_or_kv, try_parse_gs1_paren, try_parse_gs1_fnc1, try_parse_label_kv, try_parse_label_compact):
+def parse_any_scan(raw_code: str) -> Dict[str,str]:
+    # 1) Strip AIM prefix if present.
+    code = strip_aim_prefix(raw_code)
+    # 2) Try multiple strategies.
+    for fn in (
+        try_parse_json,
+        try_parse_query_or_kv,
+        try_parse_gs1_paren,
+        try_parse_gs1_fnc1,
+        try_parse_gs1_numeric_naked,  # NEW: handle your "240..." case
+        try_parse_label_kv,
+        try_parse_label_compact,
+    ):
         try:
             parsed = fn(code)
         except Exception:
@@ -373,7 +389,7 @@ def parse_any_scan(code: str) -> Dict[str,str]:
 
 # ------------------ SIDEBAR ------------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.4.3 (QR compatibility + debugger)", icon="🧭")
+    st.info("BUILD: outbound-batch v1.4.4 (AIM prefix + GS1 AI 240/241 mapping)", icon="🧭")
     st.markdown("### ⚙️ Settings")
     ss["operator"] = st.text_input("Operator (optional)", value=ss.operator, placeholder="e.g., Carlos")
     ss["current_order"] = st.text_input("Order # (optional)", value=ss.current_order, placeholder="e.g., SO-12345")
@@ -406,9 +422,9 @@ with st.sidebar:
         c1, c2 = st.columns(2)
         with c1:
             ss.lookup_cols["pallet"] = st.selectbox("Pallet column", options=cols, index=cols.index(g["pallet"]) if g["pallet"] in cols else 0)
-            ss.lookup_cols["sku"] = st.selectbox("SKU column", options=["(none)"] + cols, index=(cols.index(g["sku"]) + 1) if g["sku"] in cols else 0)
+            ss.lookup_cols["sku"]   = st.selectbox("SKU column", options=["(none)"] + cols, index=(cols.index(g["sku"]) + 1) if g["sku"] in cols else 0)
         with c2:
-            ss.lookup_cols["lot"] = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g["lot"]) + 1) if g["lot"] in cols else 0)
+            ss.lookup_cols["lot"]      = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g["lot"]) + 1) if g["lot"] in cols else 0)
             ss.lookup_cols["location"] = st.selectbox("Location column", options=["(none)"] + cols, index=(cols.index(g["location"]) + 1) if g["location"] in cols else 0)
         for k in ["sku","lot","location"]:
             if ss.lookup_cols.get(k) == "(none)":
@@ -436,9 +452,7 @@ with st.sidebar:
         })
 
 if KIOSK:
-    st.markdown("""
-    <style>#MainMenu, footer {visibility:hidden;}</style>
-    """, unsafe_allow_html=True)
+    st.markdown("<style>#MainMenu, footer {visibility:hidden;}</style>", unsafe_allow_html=True)
 
 # ------------------ HEADER ------------------
 st.title("📦 Picking Helper — Outbound (Batch)")
@@ -460,11 +474,11 @@ def on_pallet_scan():
     code = clean_scan(raw)
     if not code:
         return
-    ss.last_raw_scan = raw  # keep the raw (may include FNC1)
+    ss.last_raw_scan = raw  # keep true raw for debugger
 
     norm = parse_any_scan(code)
 
-    pallet_id = norm.get("pallet") or code
+    pallet_id = norm.get("pallet") or strip_aim_prefix(code) or code
     ss.current_pallet = pallet_id
 
     loc = norm.get("location")
@@ -493,7 +507,7 @@ def on_pallet_scan():
     if ss.lot_number: bits.append(f"LOT {ss.lot_number}")
     st.toast("\n".join(bits), icon="✅")
 
-    ss.recent_scans.insert(0, (datetime.now().strftime("%H:%M:%S"), code))
+    ss.recent_scans.insert(0, (datetime.now().strftime("%H:%M:%S"), strip_aim_prefix(code)))
     ss.recent_scans = ss.recent_scans[:25]
     ss.scan = ""
 
@@ -553,7 +567,7 @@ st.subheader("Pallet ID")
 cP1, cP2 = st.columns([2, 1])
 with cP1:
     st.text_input("Scan pallet here", key="scan",
-        placeholder="Scan pallet barcode (JSON/query/GS1/label parsed if present)",
+        placeholder="Scan pallet barcode (GS1/AIM/JSON/query/label parsed)",
         on_change=on_pallet_scan)
 with cP2:
     st.text_input("…or type Pallet ID", key="typed_pallet_id", placeholder="e.g., JTL00496")
@@ -565,10 +579,13 @@ with st.expander("🔍 Raw Scan Debugger (last pallet scan)", expanded=False):
         st.code(repr(raw), language="text")
         hexes = " ".join(f"{ord(c):02X}" for c in raw)
         st.caption(f"Hex bytes: {hexes}")
+        if raw.startswith("]"):
+            st.info(f"Detected AIM symbology prefix: {raw[:3]!r}", icon="🔖")
         if "\x1D" in raw:
             st.success("Detected ASCII 29 (FNC1) in the raw scan — GS1 mode.", icon="✅")
         else:
             st.info("No FNC1 (ASCII 29) detected in raw scan.", icon="ℹ️")
+        st.caption(f"After stripping AIM: {strip_aim_prefix(clean_scan(raw))!r}")
     else:
         st.caption("No raw pallet scan captured yet.")
 
@@ -842,3 +859,4 @@ if os.path.exists(LOG_FILE):
         st.code(open(LOG_FILE, "r", encoding="utf-8", errors="ignore").read().splitlines()[-10:])
 else:
     st.info("No log entries yet today.")
+``.")
