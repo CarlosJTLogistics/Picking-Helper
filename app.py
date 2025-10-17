@@ -1,5 +1,5 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.6.4 — Auto-clear top fields after Add; toggle to keep/clear staging; keep prior fixes (AIM, LOT/QTY defaults, safe clear)
+# v1.6.5 — 12-hour timestamps; optional Teams Incoming Webhook notify; preserves AIM/LOT/QTY defaults & auto-clear
 
 import os
 import io
@@ -28,6 +28,7 @@ def _get_cfg():
         return val
     cfg = {
         "webhook_url": get("webhook_url", "PICKING_HELPER_WEBHOOK_URL", ""),
+        "teams_webhook_url": get("teams_webhook_url", "PICKING_HELPER_TEAMS_WEBHOOK_URL", ""),  # NEW
         "notify_to": get("notify_to", "PICKING_HELPER_NOTIFY_TO", ""),
         "lookup_file": get("lookup_file", "PICKING_HELPER_LOOKUP_FILE", ""),
         "log_dir": get("log_dir", "PICKING_HELPER_LOG_DIR", "logs"),
@@ -35,7 +36,6 @@ def _get_cfg():
         "require_location": str(get("require_location", "PICKING_HELPER_REQUIRE_LOCATION", "1")).strip().lower() in ("1","true","yes"),
         "require_staging": str(get("require_staging", "PICKING_HELPER_REQUIRE_STAGING", "0")).strip().lower() in ("1","true","yes"),
         "scan_to_add": str(get("scan_to_add", "PICKING_HELPER_SCAN_TO_ADD", "1")).strip().lower() in ("1","true","yes"),
-        # new behavior toggle (defaults)
         "keep_staging_after_add": str(get("keep_staging_after_add", "PICKING_HELPER_KEEP_STAGING_AFTER_ADD", "1")).strip().lower() in ("1","true","yes"),
     }
     nt = cfg["notify_to"]
@@ -62,6 +62,7 @@ LOG_DIR = CFG["log_dir"] or "logs"
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"picking-log-{TODAY}.csv")
 WEBHOOK_URL = (CFG["webhook_url"] or "").strip()
+TEAMS_WEBHOOK_URL = (CFG["teams_webhook_url"] or "").strip()
 NOTIFY_TO: List[str] = CFG["notify_to"]
 LOOKUP_FILE_ENV = (CFG["lookup_file"] or "").strip()
 KIOSK = CFG["kiosk"]
@@ -93,7 +94,7 @@ defaults = {
     "start_qty_by_pallet": {},     # pallet_id -> int
     "pallet_qty": None,            # KPI value for current pallet
     "clear_qty_next": False,       # safe clear for QTY input
-    "clear_top_next": False,       # NEW: safe clear top pallet/fields before UI draw
+    "clear_top_next": False,       # safe clear top pallet/fields before UI draw
 }
 for k, v in defaults.items():
     if k not in ss:
@@ -123,6 +124,11 @@ def safe_int(x, default=0) -> int:
 def clamp_nonneg(n: Optional[int]) -> Optional[int]:
     if n is None: return None
     return max(int(n), 0)
+
+# 12-hour timestamp helper
+def ts12(dt: Optional[datetime] = None) -> str:
+    """Return local 12-hour timestamp like '2025-10-17 09:14:05 AM'."""
+    return (dt or datetime.now()).strftime("%Y-%m-%d %I:%M:%S %p")
 
 def append_log_row(row: dict):
     file_exists = os.path.isfile(LOG_FILE)
@@ -408,18 +414,22 @@ def parse_any_scan(raw_code: str) -> Dict[str,str]:
 
 # -------------------- SIDEBAR --------------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.6.4 (auto-clear after Add • staging toggle • AIM/LOT/QTY fixes)", icon="🧭")
+    st.info("BUILD: outbound-batch v1.6.5 (12‑hour timestamps • Teams webhook optional • auto-clear)", icon="🧭")
     st.caption(f"Config source: **{CFG['_source']}**")
 
     st.markdown("### ⚙️ Settings")
     ss["operator"] = st.text_input("Picker Name (required)", value=ss.operator, placeholder="e.g., Carlos")
 
     st.write("**Log file:**", f"`{LOG_FILE}`")
-    st.caption(f"Recipients: {', '.join(NOTIFY_TO)}")
+    st.caption(f"Recipients (email): {', '.join(NOTIFY_TO)}")
     if WEBHOOK_URL:
-        st.caption("Submit will POST to configured Power Automate webhook.")
+        st.caption("Power Automate webhook is configured (submissions POSTed there).")
     else:
-        st.warning("Webhook URL is not set. Submit will only write CSV locally.")
+        st.warning("Power Automate webhook URL is not set. Submissions will only write CSV locally.")
+    if TEAMS_WEBHOOK_URL:
+        st.caption("Teams Incoming Webhook configured — submissions will also post to that channel.")
+    else:
+        st.info("Optional: add `teams_webhook_url` (or env PICKING_HELPER_TEAMS_WEBHOOK_URL) to notify a Teams channel.")
 
     st.markdown("---")
     st.markdown("#### Inventory Lookup (manual)")
@@ -437,6 +447,7 @@ with st.sidebar:
             st.rerun()
     with cols_btn[1]:
         pass
+
     up_bytes = uploaded.read() if uploaded is not None else None
     df, guessed = None, None
     lookup_error = None
@@ -489,7 +500,6 @@ with st.sidebar:
     CFG["require_location"] = st.toggle("Require Location on Add", value=CFG["require_location"])
     CFG["require_staging"]  = st.toggle("Require Staging on Add",  value=CFG["require_staging"])
     CFG["scan_to_add"]      = st.toggle("Scan-to-Add (after QTY, staging scan auto-adds)", value=CFG["scan_to_add"])
-    # NEW: toggle for staging persistence
     CFG["keep_staging_after_add"] = st.toggle("Keep Staging Location after Add", value=CFG["keep_staging_after_add"])
     st.markdown("---")
     st.markdown("#### Start/Balance (optional)")
@@ -543,7 +553,6 @@ def _focus_qty_input():
     """, unsafe_allow_html=True)
 
 # -------------------- SAFE PRE-CLEAR BEFORE UI --------------------
-# If the previous run requested a top-field clear, do it before rendering inputs.
 if ss.clear_top_next:
     ss.clear_top_next = False
     ss.current_pallet = ""
@@ -554,9 +563,7 @@ if ss.clear_top_next:
     ss.scan = ""  # pallet scan box
     if not CFG["keep_staging_after_add"]:
         ss.staging_location_current = ""
-    # qty is cleared via ss.clear_qty_next flag below
 
-# If quantity should be cleared, clear it BEFORE the widget is created.
 if ss.clear_qty_next:
     ss.clear_qty_next = False
     st.session_state["qty_picked_str"] = ""
@@ -608,7 +615,7 @@ def on_pallet_scan():
     if ss.sku: bits.append(f"SKU {ss.sku}")
     if ss.lot_number: bits.append(f"LOT {ss.lot_number}")
     st.toast("\n".join(bits), icon="✅")
-    ss.recent_scans.insert(0, (datetime.now().strftime("%H:%M:%S"), strip_aim_prefix(code)))
+    ss.recent_scans.insert(0, (datetime.now().strftime("%I:%M:%S %p"), strip_aim_prefix(code)))  # 12-hour
     ss.recent_scans = ss.recent_scans[:25]
     ss.scan = ""
     ss.focus_qty = True
@@ -742,7 +749,7 @@ def _add_current_line_to_batch():
         "sku": ss.sku or "",
         "lot_number": ss.lot_number or "",
         "qty_staged": int(q),  # keep internal field name for compatibility
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": ts12(),   # 12-hour
     }
     ss.batch_rows.append(line)
     ss.undo_stack.append(("add", line))
@@ -810,7 +817,7 @@ else:
             "lot_number",
             "qty_staged",
             "remaining_qty",
-            "timestamp",
+            "timestamp",  # already 12-hour when created
         ]
         df_view = df[view_cols].copy()
         op_col1, op_col2 = st.columns([1,3])
@@ -861,7 +868,7 @@ else:
                     "sku": str(r.get("sku","")),
                     "lot_number": normalize_lot(str(r.get("lot_number",""))),
                     "qty_staged": qty,
-                    "timestamp": str(r.get("timestamp","")),
+                    "timestamp": str(r.get("timestamp","")),  # already 12-hour
                 })
             ss.picked_so_far = {}
             for row in new_rows:
@@ -887,11 +894,12 @@ else:
                     st.error("Some lines are invalid (missing required fields or qty not in 1–15). Fix and try again.")
                 else:
                     batch_id = f"BATCH-{datetime.now().isoformat(timespec='seconds')}-{(ss.operator or 'operator')}".replace(":", "")
-                    submitted_at = datetime.now().isoformat(timespec="seconds")
+                    submitted_at_iso = datetime.now().isoformat(timespec="seconds")  # keep ISO for systems
                     totals_qty = sum(safe_int(r["qty_staged"],0) for r in ss.batch_rows)
                     payload = {
                         "batch_id": batch_id,
-                        "submitted_at": submitted_at,
+                        "submitted_at": submitted_at_iso,
+                        "submitted_at_local": ts12(),  # helpful in Flow/cards
                         "operator": ss.operator or "",
                         "rows": ss.batch_rows,
                         "totals": {"lines": len(ss.batch_rows), "qty_staged_sum": totals_qty},
@@ -907,13 +915,29 @@ else:
                             sent_ok = True
                         except Exception as e:
                             send_error = str(e)
+                    # Also post to Teams Incoming Webhook if configured (non-blocking)
+                    if TEAMS_WEBHOOK_URL:
+                        try:
+                            import requests
+                            card = {
+                                "text": f"**Picking Batch Submitted**\n"
+                                        f"- Batch: `{batch_id}`\n"
+                                        f"- Picker: **{payload['operator']}**\n"
+                                        f"- Lines: **{payload['totals']['lines']}**\n"
+                                        f"- Cases: **{payload['totals']['qty_staged_sum']}**\n"
+                                        f"- Submitted: {payload['submitted_at_local']}"
+                            }
+                            requests.post(TEAMS_WEBHOOK_URL, json=card, timeout=10)
+                        except Exception:
+                            pass
+                    # Write CSV log rows (12-hour timestamps)
                     for r in ss.batch_rows:
                         pal = r.get("pallet_id","")
                         start_qty = get_start_qty(pal)
                         current_picked = safe_int(ss.picked_so_far.get(pal, 0), 0)
                         remaining_after = clamp_nonneg((start_qty - current_picked) if start_qty is not None else None)
                         append_log_row({
-                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "timestamp": ts12(),  # 12-hour
                             "operator": ss.operator or "",
                             "order_number": "",  # keep schema, blank value
                             "location": r.get("source_location",""),
@@ -936,7 +960,7 @@ else:
                     if WEBHOOK_URL and not sent_ok:
                         st.error(f"Submit saved locally, but webhook failed: {send_error}")
                     else:
-                        st.success("Submitted! Admin will receive the email/Teams notification.")
+                        st.success("Submitted! Notifications sent and history captured locally.")
                     ss.batch_rows = []
                     st.toast(
                         f"Batch {batch_id} submitted — {payload['totals']['lines']} lines / {payload['totals']['qty_staged_sum']} cases.",
