@@ -1,5 +1,5 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.7.0 — Timezone-aware 12-hour timestamps (defaults to America/Chicago) + Teams webhook + preserves AIM/LOT/QTY defaults & auto-clear
+# v1.7.1 — TZ-aware + Remaining-cap enforcement (no picking past 0) + Teams webhook + preserves AIM/LOT/QTY defaults & auto-clear
 import os
 import io
 import re
@@ -36,7 +36,7 @@ def _get_cfg():
         "require_staging": str(get("require_staging", "PICKING_HELPER_REQUIRE_STAGING", "0")).strip().lower() in ("1","true","yes"),
         "scan_to_add": str(get("scan_to_add", "PICKING_HELPER_SCAN_TO_ADD", "1")).strip().lower() in ("1","true","yes"),
         "keep_staging_after_add": str(get("keep_staging_after_add", "PICKING_HELPER_KEEP_STAGING_AFTER_ADD", "1")).strip().lower() in ("1","true","yes"),
-        # NEW: explicit timezone (IANA). Default to America/Chicago for Central Time.
+        # Explicit timezone (IANA). Default to America/Chicago for Central Time.
         "timezone": get("timezone", "PICKING_HELPER_TIMEZONE", "America/Chicago"),
     }
     nt = cfg["notify_to"]
@@ -57,23 +57,20 @@ def _get_cfg():
 
 CFG = _get_cfg()
 
-# -------------------- TIMEZONE HELPERS (NEW) --------------------
+# -------------------- TIMEZONE HELPERS --------------------
 def get_tz():
-    """Return ZoneInfo for configured timezone; fall back to None if invalid."""
     tzname = (CFG.get("timezone") or "America/Chicago").strip()
     try:
-        from zoneinfo import ZoneInfo  # py>=3.9
+        from zoneinfo import ZoneInfo
         return ZoneInfo(tzname)
     except Exception:
         return None
 
 def now_local():
-    """Timezone-aware 'now' using configured time zone; falls back to system local naive."""
     tz = get_tz()
     return datetime.now(tz) if tz else datetime.now()
 
 def ts12(dt: Optional[datetime] = None) -> str:
-    """Return 12‑hour local timestamp like '2025-10-17 09:14:05 AM' honoring configured timezone."""
     if dt is None:
         dt = now_local()
     else:
@@ -137,7 +134,6 @@ def clean_scan(raw: str) -> str:
     return (raw or "").replace("\r", "").replace("\n", "").strip()
 
 def strip_aim_prefix(s: str) -> str:
-    # Remove AIM symbology prefix like "]C1", "]A0", etc.
     m = re.match(r"^\][A-Za-z]\d", s)
     return s[m.end():] if m else s
 
@@ -212,10 +208,8 @@ def _auto_guess_cols(columns: List[str]) -> Dict[str, Optional[str]]:
     return {
         "pallet": pick(["pallet","pallet id","pallet_id","lpn","license","serial","sscc"]),
         "sku": pick(["sku","item","itemcode","product","part","material"]),
-        # Default LOT -> CustomerLotReference (plus aliases)
         "lot": pick(["customerlotreference","customer lot reference","lot","lot_number","lot #","lot#","batch","batchno"]),
         "location": pick(["location","loc","bin","slot","binlocation","location code","staging","stg"]),
-        # Default QTY -> QTYOnHand (plus aliases)
         "qty": pick(["qtyonhand","qty","quantity","cases","casecount","count","units","pallet_qty","onhand","on_hand"]),
     }
 
@@ -437,12 +431,11 @@ def parse_any_scan(raw_code: str) -> Dict[str,str]:
 
 # -------------------- SIDEBAR --------------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.7.0 (TZ-aware • 12‑hour timestamps • Teams webhook • auto‑clear)", icon="🧭")
+    st.info("BUILD: outbound-batch v1.7.1 (TZ-aware • Remaining-cap • 12‑hour timestamps • Teams webhook • auto‑clear)", icon="🧭")
     st.caption(f"Config source: **{CFG['_source']}**")
 
     st.markdown("### ⚙️ Settings")
     ss["operator"] = st.text_input("Picker Name (required)", value=ss.operator, placeholder="e.g., Carlos")
-    # Timezone control (NEW)
     CFG["timezone"] = st.text_input(
         "Timezone (IANA)", value=CFG.get("timezone") or "America/Chicago",
         help="Examples: America/Chicago • America/Denver • UTC • America/New_York"
@@ -494,7 +487,7 @@ with st.sidebar:
             "lot": "CustomerLotReference",
             "sku": "WarehouseSku",
             "location": "LocationName",
-            "qty": None,  # handled below
+            "qty": None,
         }
         g = guessed or {"pallet": None, "sku": None, "lot": None, "location": None, "qty": None}
         for key, want in desired_defaults.items():
@@ -556,7 +549,7 @@ if KIOSK:
 
 # -------------------- HEADER --------------------
 st.title("📦 Picking Helper — Outbound (Batch)")
-st.caption("Scan Pallet → KPI shows Pallet QTY → QTY Picked (max 15) → (optional) Staging → Add to Batch → Review & Submit")
+st.caption("Scan Pallet → KPI shows Pallet QTY → QTY Picked (max 15, not above Remaining) → (optional) Staging → Add to Batch → Review & Submit")
 
 def _focus_first_text():
     st.markdown("""
@@ -641,7 +634,11 @@ def on_pallet_scan():
     if ss.current_location: bits.append(f"Location {ss.current_location}")
     if ss.sku: bits.append(f"SKU {ss.sku}")
     if ss.lot_number: bits.append(f"LOT {ss.lot_number}")
-    st.toast("\n".join(bits), icon="✅")
+    rem_now = get_remaining_for_pallet(ss.current_pallet)
+    if rem_now is not None and rem_now <= 0:
+        st.toast("Pallet fully picked — Remaining 0", icon="✅")
+    else:
+        st.toast("\n".join(bits), icon="✅")
     ss.recent_scans.insert(0, (now_local().strftime("%I:%M:%S %p"), strip_aim_prefix(code)))  # 12‑hour
     ss.recent_scans = ss.recent_scans[:25]
     ss.scan = ""
@@ -723,16 +720,28 @@ qty_str = st.text_input(
     "Enter QTY Picked",
     key="qty_picked_str",
     placeholder="e.g., 5",
-    help="Type the quantity picked for this line (max 15)."
+    help="Type the quantity picked for this line (max 15 and not above Remaining)."
 )
 ss.qty_staged = safe_int(qty_str, 0)
+
+# Compute add button disabled based on Remaining (if start qty is known)
+_current_start = get_start_qty(ss.current_pallet)
+_current_remaining = get_remaining_for_pallet(ss.current_pallet) if _current_start is not None else None
+disable_add = (not bool(ss.operator)) or (
+    _current_start is not None and _current_remaining is not None and _current_remaining <= 0
+)
+
 if ss.focus_qty:
     _focus_qty_input()
     ss.focus_qty = False
 
 colA, colC, colD, colE = st.columns([1,1,1,1])
 with colA:
-    add_to_batch_click = st.button("➕ Add to Batch", use_container_width=True, disabled=(not bool(ss.operator)))
+    add_to_batch_click = st.button(
+        "➕ Add to Batch",
+        use_container_width=True,
+        disabled=disable_add
+    )
 with colC:
     undo_last = st.button("↩ Undo Last Line", use_container_width=True, disabled=not ss.batch_rows and not ss.undo_stack)
 with colD:
@@ -747,6 +756,9 @@ with colD:
 with colE:
     clear_batch = st.button("🗑️ Clear Batch", use_container_width=True, disabled=not ss.batch_rows)
 
+if disable_add and _current_start is not None and _current_remaining is not None and ss.current_pallet:
+    st.info(f"Pallet **{ss.current_pallet}** is fully picked (Remaining 0).", icon="✅")
+
 def _add_current_line_to_batch():
     if not ss.operator:
         st.error("Enter **Picker Name** before adding.")
@@ -760,6 +772,7 @@ def _add_current_line_to_batch():
     if CFG["require_staging"] and not ss.staging_location_current:
         st.error("Scan/Type a **Staging Location** before adding.")
         return False
+
     q = safe_int(ss.qty_staged, 0)
     if q <= 0:
         st.error("Enter a **QTY Picked** > 0.")
@@ -767,6 +780,18 @@ def _add_current_line_to_batch():
     if q > 15:
         st.warning("QTY Picked capped at 15 cases per line.")
         q = 15
+
+    start_qty = get_start_qty(ss.current_pallet)
+    if start_qty is not None:
+        remaining_before = get_remaining_for_pallet(ss.current_pallet) or 0
+        if remaining_before <= 0:
+            st.error(f"Pallet **{ss.current_pallet}** is fully picked. Remaining is 0 — cannot add more.")
+            return False
+        if q > remaining_before:
+            st.warning(f"QTY {q} exceeds Remaining {remaining_before}. Using {remaining_before} instead.")
+            q = remaining_before
+
+    # Apply
     upsert_picked(ss.current_pallet, q)
     line = {
         "order_number": "",  # schema retained: left blank
@@ -784,9 +809,8 @@ def _add_current_line_to_batch():
         f"Added: Pallet {line['pallet_id']} — QTY {line['qty_staged']}"
         + (f" → {line['staging_location']}" if line['staging_location'] else "")
     )
-    # Request safe clears on the next run
-    ss.clear_qty_next = True   # clears QTY Picked widget
-    ss.clear_top_next = True   # clears top pallet fields (and staging if toggle is off)
+    ss.clear_qty_next = True
+    ss.clear_top_next = True
     ss.qty_staged = 0
     st.rerun()
     return True
@@ -844,7 +868,7 @@ else:
             "lot_number",
             "qty_staged",
             "remaining_qty",
-            "timestamp",  # already 12-hour local when created
+            "timestamp",
         ]
         df_view = df[view_cols].copy()
         op_col1, op_col2 = st.columns([1,3])
@@ -854,7 +878,7 @@ else:
             total_lines = len(df_view)
             total_qty = int(df["qty_staged"].sum())
             st.metric("Batch Totals", f"{total_lines} lines / {total_qty} cases")
-        st.caption("Edit QTY or fields if needed (0-qty rows are dropped). Then **Apply Edits** → **Submit All**.")
+        st.caption("Edit QTY or fields (0-qty rows are dropped). **Capped at Remaining** per pallet. Then **Apply Edits** → **Submit All**.")
         edited = st.data_editor(
             df_view,
             use_container_width=True,
@@ -878,47 +902,72 @@ else:
             apply_edits = st.button("💾 Apply Edits", use_container_width=True)
         with colR2:
             submit_all = st.button("✅ Submit All", use_container_width=True, disabled=(not bool(ss.operator)))
+
         if apply_edits:
-            new_rows = []
+            # Enforce per-pallet remaining caps while applying edits
+            new_rows: List[Dict] = []
+            warn_msgs: List[str] = []
+            running_totals: Dict[str, int] = {}
             for _, r in edited.iterrows():
+                pallet = str(r.get("pallet_id","")).strip()
+                if not pallet:
+                    continue
                 qty = safe_int(r.get("qty_staged", 0), 0)
                 if qty <= 0:
                     continue
                 if qty > 15:
-                    st.error(f"Line for pallet {r.get('pallet_id','?')}: qty {qty} > 15 (max). Using 15.")
+                    warn_msgs.append(f"Pallet {pallet}: qty {qty} > 15 — using 15.")
                     qty = 15
+                start_q = get_start_qty(pallet)
+                if start_q is not None:
+                    used = running_totals.get(pallet, 0)
+                    remaining_here = max(start_q - used, 0)
+                    if remaining_here <= 0:
+                        warn_msgs.append(f"Pallet {pallet}: fully picked — skipping this line.")
+                        continue
+                    if qty > remaining_here:
+                        warn_msgs.append(f"Pallet {pallet}: qty {qty} exceeds Remaining {remaining_here} — using {remaining_here}.")
+                        qty = remaining_here
+                    running_totals[pallet] = used + qty
+                # Build row
                 new_rows.append({
-                    "order_number": "",  # keep blank
+                    "order_number": "",
                     "source_location": str(r.get("source_location","")),
                     "staging_location": str(r.get("staging_location","")),
-                    "pallet_id": str(r.get("pallet_id","")),
+                    "pallet_id": pallet,
                     "sku": str(r.get("sku","")),
                     "lot_number": normalize_lot(str(r.get("lot_number",""))),
                     "qty_staged": qty,
-                    "timestamp": str(r.get("timestamp","")),  # already 12-hour local
+                    "timestamp": str(r.get("timestamp","")),
                 })
+            # Rebuild picked_so_far based on new rows
             ss.picked_so_far = {}
             for row in new_rows:
                 upsert_picked(row.get("pallet_id",""), safe_int(row.get("qty_staged"),0))
             ss.batch_rows = new_rows
-            st.success("Edits applied.")
+            if warn_msgs:
+                st.warning("• " + "\n• ".join(warn_msgs))
+            st.success("Edits applied (remaining caps enforced).")
+
         if submit_all:
             if not ss.operator:
                 st.error("Picker Name is required.")
             elif not ss.batch_rows:
                 st.error("Batch is empty.")
             else:
-                bad = []
+                # Final validation: do not allow any pallet to exceed its start qty
+                overfull: List[str] = []
+                totals: Dict[str, int] = {}
                 for r in ss.batch_rows:
-                    if (CFG["require_location"] and not r.get("source_location")) or not r.get("pallet_id"):
-                        bad.append(r)
-                    if CFG["require_staging"] and not r.get("staging_location"):
-                        bad.append(r)
+                    p = r.get("pallet_id","")
                     q = safe_int(r.get("qty_staged", 0), 0)
-                    if q <= 0 or q > 15:
-                        bad.append(r)
-                if bad:
-                    st.error("Some lines are invalid (missing required fields or qty not in 1–15). Fix and try again.")
+                    totals[p] = totals.get(p, 0) + q
+                for p, s in totals.items():
+                    start_q = get_start_qty(p)
+                    if start_q is not None and s > start_q:
+                        overfull.append(f"{p} (total {s} > start {start_q})")
+                if overfull:
+                    st.error("Cannot submit: these pallets would exceed their starting quantity:\n- " + "\n- ".join(overfull))
                 else:
                     # Use local, tz-aware time for IDs and ISO
                     dt_now = now_local()
@@ -928,7 +977,7 @@ else:
                     payload = {
                         "batch_id": batch_id,
                         "submitted_at": submitted_at_iso,
-                        "submitted_at_local": ts12(),  # helpful in Flow/cards
+                        "submitted_at_local": ts12(),
                         "operator": ss.operator or "",
                         "rows": ss.batch_rows,
                         "totals": {"lines": len(ss.batch_rows), "qty_staged_sum": totals_qty},
@@ -944,7 +993,6 @@ else:
                             sent_ok = True
                         except Exception as e:
                             send_error = str(e)
-                    # Also post to Teams Incoming Webhook if configured (non-blocking)
                     if TEAMS_WEBHOOK_URL:
                         try:
                             import requests
@@ -966,9 +1014,9 @@ else:
                         current_picked = safe_int(ss.picked_so_far.get(pal, 0), 0)
                         remaining_after = clamp_nonneg((start_qty - current_picked) if start_qty is not None else None)
                         append_log_row({
-                            "timestamp": ts12(),  # 12-hour local
+                            "timestamp": ts12(),
                             "operator": ss.operator or "",
-                            "order_number": "",  # keep schema, blank value
+                            "order_number": "",
                             "location": r.get("source_location",""),
                             "staging_location": r.get("staging_location",""),
                             "pallet_id": pal,
