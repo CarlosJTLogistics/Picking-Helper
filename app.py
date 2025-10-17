@@ -1,7 +1,6 @@
 # app.py — Outbound Picking Helper (Batch Submit)
 # v1.9.1 — Picker Name on main • Pallet scan gated by Picker • Sticky Action Bar • Color Status • Floating Summary • Global Batch Cap • Duplicate Merge
 # Offline queue + retry • Voice feedback (toggle) • EN/ES i18n • Mobile UI
-
 import os
 import io
 import re
@@ -14,7 +13,6 @@ from typing import Optional, Dict, List, Tuple
 from urllib.parse import urlparse, parse_qs, unquote_plus
 from datetime import datetime
 from pathlib import Path
-
 import streamlit as st
 
 # -------------------- PAGE SETUP --------------------
@@ -27,7 +25,6 @@ st.markdown("""
 # -------------------- CONFIG (Secrets-first, env fallback) --------------------
 def _get_cfg():
     sec = st.secrets.get("picking_helper", {}) if hasattr(st, "secrets") else {}
-
     def get(name, env, default=None):
         val = sec.get(name) if isinstance(sec, dict) else None
         if val in (None, "", []):
@@ -58,7 +55,7 @@ def _get_cfg():
         notify = nt
     else:
         import re as _re
-        parts = _re.split(r"[,;]", nt) if nt else []
+        parts = _re.split(r"[ ,;]", nt) if nt else []
         notify = [p.strip() for p in parts if p.strip()]
     if not notify:
         notify = [
@@ -101,7 +98,6 @@ def ts12(dt: Optional[datetime] = None) -> str:
     return dt.strftime("%Y-%m-%d %I:%M:%S %p")
 
 TODAY = now_local().strftime("%Y-%m-%d")
-
 LOG_DIR = CFG["log_dir"] or "logs"
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"picking-log-{TODAY}.csv")
@@ -109,7 +105,6 @@ LOG_FILE = os.path.join(LOG_DIR, f"picking-log-{TODAY}.csv")
 WEBHOOK_URL = (CFG["webhook_url"] or "").strip()
 TEAMS_WEBHOOK_URL = (CFG["teams_webhook_url"] or "").strip()
 NOTIFY_TO: List[str] = CFG["notify_to"]
-
 LOOKUP_FILE_ENV = (CFG["lookup_file"] or "").strip()
 
 # Persistent lookup paths (as in v1.8)
@@ -349,7 +344,6 @@ def load_lookup(path: Optional[str], uploaded_bytes: Optional[bytes]):
         raise
     except Exception as e:
         raise RuntimeError(f"Lookup load error: {e}")
-
     if df is not None and len(df) > 0:
         df.columns = [str(c).strip() for c in df.columns]
         return df, _auto_guess_cols(list(df.columns))
@@ -413,7 +407,7 @@ def try_parse_label_kv(s: str) -> Optional[Dict[str,str]]:
     return out or None
 
 def try_parse_label_compact(s: str) -> Optional[Dict[str,str]]:
-    tokens = re.split(r"[,\s;]+", s.strip())
+    tokens = re.split(r"[,\\s;]+", s.strip())
     out = {}
     i = 0
     while i < len(tokens) - 1:
@@ -425,7 +419,7 @@ def try_parse_label_compact(s: str) -> Optional[Dict[str,str]]:
     return out or None
 
 def try_parse_gs1_paren(s: str) -> Optional[Dict[str,str]]:
-    pairs = re.findall(r"\((\d{2,4})\)([^\(\)]+)", s)
+    pairs = re.findall(r"\((\d{2,4})\)([^()]+)", s)
     if not pairs:
         return None
     out: Dict[str,str] = {}
@@ -728,7 +722,6 @@ with st.sidebar:
     # NOTE: Picker input REMOVED from sidebar; now on main panel per v1.9.1
     CFG["timezone"] = st.text_input(_t("tz_label"), value=CFG.get("timezone") or "America/Chicago")
     st.caption(f"{_t('time_now')}: {ts12()} (TZ: {CFG['timezone'] or 'system'})")
-
     st.write("**Log file:**", f"`{LOG_FILE}`")
     st.caption(f"Recipients (email): {', '.join(NOTIFY_TO)}")
     if WEBHOOK_URL:
@@ -740,14 +733,13 @@ with st.sidebar:
     pend = len(_pending_files())
     if pend:
         st.warning(f"{_t('pending_q')}: **{pend}**", icon="📥")
-    if st.button(_t("retry_now"), use_container_width=True, disabled=pend==0 or not WEBHOOK_URL):
-        sent, failed = _retry_pending(WEBHOOK_URL)
-        st.toast(_t("retry_result", sent=sent, failed=failed), icon="🔁")
+        if st.button(_t("retry_now"), use_container_width=True, disabled=pend==0 or not WEBHOOK_URL):
+            sent, failed = _retry_pending(WEBHOOK_URL)
+            st.toast(_t("retry_result", sent=sent, failed=failed), icon="🔁")
 
     st.markdown("---")
     st.markdown(f"#### #### {_t('inv_lookup')}")
     st.caption("Upload your latest RAMP export (CSV/XLS/XLSX).")
-
     persisted_path = _get_persisted_lookup_path()
     if LOOKUP_FILE_ENV and os.path.exists(LOOKUP_FILE_ENV):
         current_source_note = f"Using Secrets/Env file: `{LOOKUP_FILE_ENV}`"
@@ -783,7 +775,6 @@ with st.sidebar:
 
     up_name = uploaded.name if uploaded is not None else None
     up_bytes = uploaded.read() if uploaded is not None else None
-
     load_path = LOOKUP_FILE_ENV or (None if up_bytes else persisted_path)
     df, guessed = None, None
     lookup_error = None
@@ -895,7 +886,6 @@ if ss.clear_top_next:
     ss.scan = ""
     if not CFG["keep_staging_after_add"]:
         ss.staging_location_current = ""
-
 if ss.clear_qty_next:
     ss.clear_qty_next = False
     st.session_state["qty_picked_str"] = ""
@@ -961,6 +951,7 @@ def on_pallet_scan():
         st.toast(_t("pallet_full"), icon="✅"); _voice(_t("pallet_full"))
     else:
         st.toast("\n".join(bits), icon="✅")
+
     ss.recent_scans.insert(0, (now_local().strftime("%I:%M:%S %p"), strip_aim_prefix(code)))
     ss.recent_scans = ss.recent_scans[:25]
     ss.scan = ""; ss.focus_qty = True
@@ -982,26 +973,16 @@ def set_typed_staging():
 
 # -------------------- MAIN PANEL: Picker (FIRST), then Pallet Scan --------------------
 st.subheader(_t("picker_required"))
-ss["operator"] = st.text_input(
-    _t("picker_required"),
-    key="operator",
-    value=ss.operator,
-    placeholder="e.g., Carlos",
-    help="Required before scanning pallets. Used on notifications and CSV logs."
-)
-if not ss.operator:
-    st.warning("Enter the Picker Name above to begin.", icon="👆")
-
-st.subheader(_t("picker_required"))
 st.text_input(
     _t("picker_required"),
     key="operator",
-    value=ss.operator,
+    value=ss.get("operator", ""),
     placeholder="e.g., Carlos",
     help="Required before scanning pallets. Used on notifications and CSV logs."
 )
-if not ss.operator:
+if not ss.get("operator"):
     st.warning("Enter the Picker Name above to begin.", icon="👆")
+
 with st.expander(_t("raw_debug"), expanded=False):
     if ss.last_raw_scan:
         raw = ss.last_raw_scan
@@ -1074,9 +1055,8 @@ total_lines = len(ss.batch_rows)
 total_qty = sum(safe_int(r.get("qty_staged"),0) for r in ss.batch_rows)
 st.markdown(f"""
 **{_t('batch_totals')}** — {_t('total_lines_cases', lines=total_lines, cases=total_qty)}
-Cap: {int(CFG.get('batch_max_qty',200))} cases 
+Cap: {int(CFG.get('batch_max_qty',200))} cases
 """, unsafe_allow_html=True)
-
 st.markdown("---")
 
 # -------------------- QTY Picked + Batch controls --------------------
@@ -1192,12 +1172,11 @@ def _add_current_line_to_batch():
         "qty_staged": int(q),
         "timestamp": ts12(),
     }
-
     # duplicate merge (same pallet + same staging)
     if not _merge_duplicate_if_any(line):
         ss.batch_rows.append(line)
-    ss.undo_stack.append(("add", line))
-    st.success(_t("added_line", pallet=line["pallet_id"], qty=line["qty_staged"])); _voice(_t("added_line", pallet=line["pallet_id"], qty=line["qty_staged"]))
+        ss.undo_stack.append(("add", line))
+        st.success(_t("added_line", pallet=line["pallet_id"], qty=line["qty_staged"])); _voice(_t("added_line", pallet=line["pallet_id"], qty=line["qty_staged"]))
     ss.clear_qty_next = True
     ss.clear_top_next = True
     ss.qty_staged = 0
@@ -1230,7 +1209,6 @@ if undo_last:
 # -------------------- REVIEW & SUBMIT --------------------
 st.markdown("---")
 st.subheader(_t("review_submit"))
-
 if not ss.batch_rows:
     st.info(_t("no_items"))
 else:
@@ -1239,17 +1217,14 @@ else:
         df = pd.DataFrame(ss.batch_rows)
     except Exception:
         df = None
-
     if df is not None and not df.empty:
         df["qty_staged"] = df["qty_staged"].apply(lambda x: max(safe_int(x,0),0))
         df["start_qty"] = df["pallet_id"].apply(lambda p: get_start_qty(p))
         df["cum_staged"] = df.groupby("pallet_id")["qty_staged"].cumsum()
-
         def rem_after(row):
             if row["start_qty"] is None:
                 return None
             return max(safe_int(row["start_qty"],0) - safe_int(row["cum_staged"],0), 0)
-
         df["remaining_qty"] = df.apply(rem_after, axis=1)
         df["picker_name"] = ss.operator or ""
 
@@ -1268,7 +1243,6 @@ else:
             st.metric(_t("batch_totals"), _t("total_lines_cases", lines=total_lines, cases=total_qty))
 
         st.caption("Edit QTY or fields (0-qty rows are dropped). **Capped at Remaining & batch cap**. Then **Apply Edits** → **Submit All**.")
-
         edited = st.data_editor(
             df_view,
             use_container_width=True,
@@ -1294,6 +1268,9 @@ else:
         with colR2:
             submit_all = st.button(_t("submit_all"), use_container_width=True, disabled=(not bool(ss.operator)), key="submit_top")
 
+        # Honor bottom-bar trigger too
+        submit_all = submit_all or st.session_state.pop("__submit_request", False)
+
         if apply_edits:
             # Enforce per-pallet remaining caps + batch cap while applying edits
             new_rows: List[Dict] = []
@@ -1301,7 +1278,6 @@ else:
             running_totals: Dict[str, int] = {}
             batch_cap = int(CFG.get("batch_max_qty",200))
             current_sum = 0
-
             for _, r in edited.iterrows():
                 pallet = str(r.get("pallet_id","")).strip()
                 if not pallet:
@@ -1311,7 +1287,6 @@ else:
                     continue
                 if qty > 15:
                     warn_msgs.append("qty > 15 — using 15."); qty = 15
-
                 start_q = get_start_qty(pallet)
                 if start_q is not None:
                     used = running_totals.get(pallet, 0)
@@ -1369,7 +1344,6 @@ else:
                     start_q = get_start_qty(p)
                     if start_q is not None and s > start_q:
                         overfull.append(f"{p} (total {s} > start {start_q})")
-
                 if overfull:
                     st.error("Cannot submit: these pallets would exceed starting quantity:\n- " + "\n- ".join(overfull))
                 else:
@@ -1386,7 +1360,6 @@ else:
                         "totals": {"lines": len(ss.batch_rows), "qty_staged_sum": totals_qty},
                         "notify_to": NOTIFY_TO,
                     }
-
                     sent_ok = False; send_error = None
                     if WEBHOOK_URL:
                         try:
@@ -1397,6 +1370,9 @@ else:
                         except Exception as e:
                             send_error = str(e)
                             _queue_submission(payload, batch_id)  # offline queue
+                    else:
+                        # If no webhook, still store for history
+                        _queue_submission(payload, batch_id)
 
                     if TEAMS_WEBHOOK_URL:
                         try:
@@ -1435,7 +1411,6 @@ else:
                             "batch_id": batch_id,
                             "action": "SUBMIT",
                         })
-
                     try:
                         with open(os.path.join(LOG_DIR, f"{batch_id}.json"), "w", encoding="utf-8") as jf:
                             json.dump(payload, jf, ensure_ascii=False, indent=2)
@@ -1447,6 +1422,7 @@ else:
                         _voice("Submission queued for retry")
                     else:
                         st.success(_t("submit_ok")); _voice("Submitted")
+
                     ss.batch_rows = []
                     st.toast(
                         f"Batch {batch_id} — {payload['totals']['lines']} lines / {payload['totals']['qty_staged_sum']} cases.",
@@ -1477,7 +1453,6 @@ else:
 # -------------------- Sticky Bottom Action Bar --------------------
 st.markdown("""
 """, unsafe_allow_html=True)
-
 bar_c1, bar_c2, bar_c3, bar_c4 = st.columns(4)
 with bar_c1:
     add_bottom = st.button(_t("add_batch"), key="add_bottom", use_container_width=True, disabled=disable_add)
@@ -1491,7 +1466,6 @@ with bar_c4:
 # Wire bottom bar events to same handlers
 if add_bottom:
     _add_current_line_to_batch()
-
 if undo_bottom:
     if ss.batch_rows:
         last = ss.batch_rows.pop()
@@ -1506,7 +1480,7 @@ if undo_bottom:
             st.success(f"Restored line for pallet {row.get('pallet_id','?')}.")
 
 if submit_bottom:
-    st.session_state["submit_top"] = True  # hint for user; actual logic executed above on click
+    st.session_state["__submit_request"] = True  # neutral flag, not a widget key
     st.rerun()
 
 if clear_bottom:
