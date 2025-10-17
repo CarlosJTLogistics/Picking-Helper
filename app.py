@@ -231,7 +231,8 @@ def clean_scan(raw: str) -> str:
     return (raw or "").replace("\r", "").replace("\n", "").strip()
 
 def strip_aim_prefix(s: str) -> str:
-    m = re.match(r"^\][A-Za-z]\d", s)
+    # AIM symbology prefixes look like ]Xn, e.g., ]C1, ]e0, ]d2
+    m = re.match(r'^\][A-Za-z]\d', s)
     return s[m.end():] if m else s
 
 def safe_int(x, default=0) -> int:
@@ -737,6 +738,13 @@ with st.sidebar:
             sent, failed = _retry_pending(WEBHOOK_URL)
             st.toast(_t("retry_result", sent=sent, failed=failed), icon="🔁")
 
+# Auto retry once per session if enabled via Secrets/Env
+if CFG.get("retry_pending_on_start") and WEBHOOK_URL and not ss.retried_on_start:
+    sent, failed = _retry_pending(WEBHOOK_URL)
+    ss.retried_on_start = True
+    if sent or failed:
+        st.toast(_t("retry_result", sent=sent, failed=failed), icon="🔁")
+
     st.markdown("---")
     st.markdown(f"#### #### {_t('inv_lookup')}")
     st.caption("Upload your latest RAMP export (CSV/XLS/XLSX).")
@@ -1020,6 +1028,15 @@ with c4:
     st.metric(_t("lot_number"), ss.lot_number or "—")
 with c5:
     st.metric(_t("source_location"), ss.current_location or "—")
+
+# --- Pallet Scan (added in v1.9.2) ------------------------------------------
+st.subheader(_t("pallet_id"))
+st.text_input(
+    _t("scan_pallet_here"),
+    key="scan",
+    placeholder="Scan pallet barcode here",
+    on_change=on_pallet_scan
+)
 
 c6, c7 = st.columns(2)
 with c6:
