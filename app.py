@@ -1,5 +1,7 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.4.4 — Handle AIM prefix (e.g., ]C1), AI 240/241 as pallet (LPN), and GS1 "naked numeric" without FNC1
+# v1.5 — Scan-only UI (pallet drives auto-fill); Secrets-first config; Auto-focus QTY; Scan-to-Add; Undo Last Line;
+#        Keeps GS1/AIM parsing incl. ]C1 and AI 240/241; preserves logging, webhook, tag, and log preview.
+
 import os
 import io
 import re
@@ -14,58 +16,93 @@ from datetime import datetime
 from pathlib import Path
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
+
 # ------------------ PAGE SETUP ------------------
 st.set_page_config(page_title="Picking Helper", page_icon="📦", layout="wide")
 
+# ------------------ CONFIG (Secrets-first, env fallback) ------------------
+def _get_cfg():
+    sec = st.secrets.get("picking_helper", {}) if hasattr(st, "secrets") else {}
+    def get(name, env, default=None):
+        val = sec.get(name)
+        if val in (None, "", []):
+            val = os.getenv(env, default)
+        return val
+    cfg = {
+        "webhook_url":    get("webhook_url", "PICKING_HELPER_WEBHOOK_URL", ""),
+        "notify_to":      get("notify_to", "PICKING_HELPER_NOTIFY_TO", ""),
+        "lookup_file":    get("lookup_file", "PICKING_HELPER_LOOKUP_FILE", ""),
+        "log_dir":        get("log_dir", "PICKING_HELPER_LOG_DIR", "logs"),
+        "kiosk":          str(get("kiosk", "PICKING_HELPER_KIOSK", "0")).strip() in ("1","true","True"),
+        "require_location": str(get("require_location", "PICKING_HELPER_REQUIRE_LOCATION", "1")).strip() in ("1","true","True"),
+        "require_staging":  str(get("require_staging", "PICKING_HELPER_REQUIRE_STAGING", "0")).strip() in ("1","true","True"),
+        "scan_to_add":      str(get("scan_to_add", "PICKING_HELPER_SCAN_TO_ADD", "1")).strip() in ("1","true","True"),
+    }
+    # notify_to: accept list or CSV/semicolon string
+    nt = cfg["notify_to"]
+    if isinstance(nt, list):
+        notify = nt
+    else:
+        parts = re.split(r"[;,]", nt) if nt else []
+        notify = [p.strip() for p in parts if p.strip()]
+    if not notify:
+        notify = [
+            "carlos.pacheco@jtlogistics.com",
+            "Alex.Miller@jtlogistics.com",
+            "Cody.Robles@JTlogistics.com",
+        ]
+    cfg["notify_to"] = notify
+    # Source indicator
+    cfg["_source"] = "Secrets" if "picking_helper" in st.secrets else "Env"
+    return cfg
+
+CFG = _get_cfg()
+
 # ------------------ ENV / PATHS ------------------
 TODAY = datetime.now().strftime("%Y-%m-%d")
-LOG_DIR = os.getenv("PICKING_HELPER_LOG_DIR", "logs")
+LOG_DIR = CFG["log_dir"] or "logs"
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"picking-log-{TODAY}.csv")
 
-WEBHOOK_URL = os.getenv("PICKING_HELPER_WEBHOOK_URL", "").strip()
-NOTIFY_TO_ENV = os.getenv("PICKING_HELPER_NOTIFY_TO", "").strip()
-DEFAULT_NOTIFY_TO = [
-    "carlos.pacheco@jtlogistics.com",
-    "Alex.Miller@jtlogistics.com",
-    "Cody.Robles@JTlogistics.com",
-]
-def _parse_notify_to(s: str) -> List[str]:
-    if not s:
-        return DEFAULT_NOTIFY_TO
-    parts = re.split(r"[;,]", s)
-    return [p.strip() for p in parts if p.strip()]
-NOTIFY_TO = _parse_notify_to(NOTIFY_TO_ENV)
-
-KIOSK = os.getenv("PICKING_HELPER_KIOSK", "0").strip() == "1"
-LOOKUP_FILE_ENV = os.getenv("PICKING_HELPER_LOOKUP_FILE", "").strip()
+WEBHOOK_URL = (CFG["webhook_url"] or "").strip()
+NOTIFY_TO: List[str] = CFG["notify_to"]
+LOOKUP_FILE_ENV = (CFG["lookup_file"] or "").strip()
+KIOSK = CFG["kiosk"]
 
 # ------------------ SESSION STATE ------------------
 ss = st.session_state
 defaults = {
+    # identity / context
     "operator": "",
-    "current_order": "",
-    "current_location": "",
+    "current_order": "",  # optional
+    # live fields (read-only to operator; auto-filled)
+    "current_location": "",  # source location from lookup or scan
     "current_pallet": "",
     "sku": "",
     "lot_number": "",
     "staging_location_current": "",
-    "scan": "",
-    "source_scan": "",
-    "typed_source": "",
-    "typed_pallet_id": "",
-    "lot_scan": "",
-    "typed_lot": "",
-    "staging_scan": "",
+    # scans/typing buffers
+    "scan": "",              # pallet scan
+    "staging_scan": "",      # staging scan
+    "typed_staging": "",     # staging typed
+    # qty
     "qty_staged": 0,
+    # optional tracker
     "starting_qty": None,
-    "picked_so_far": {},
+    "picked_so_far": {},     # pallet_id -> picked qty sum
+    # UX & debug
     "recent_scans": [],
-    "tag_bytes": None,
+    "last_raw_scan": "",
+    "focus_qty": False,
+    # lookup
     "lookup_df": None,
     "lookup_cols": {"pallet": None, "sku": None, "lot": None, "location": None},
+    # batch
     "batch_rows": [],
-    "last_raw_scan": "",
+    "undo_stack": [],        # for undo last line
+    "redo_stack": [],        # optional future
+    # artifacts
+    "tag_bytes": None,
 }
 for k, v in defaults.items():
     if k not in ss:
@@ -73,14 +110,10 @@ for k, v in defaults.items():
 
 # ------------------ HELPERS ------------------
 def clean_scan(raw: str) -> str:
-    # Preserve control chars like \x1D (GS1 FNC1); strip only CR/LF & edges.
+    # keep control chars like \x1D (FNC1); strip only CR/LF and edges
     return (raw or "").replace("\r", "").replace("\n", "").strip()
 
 def strip_aim_prefix(s: str) -> str:
-    """
-    Remove AIM Symbology Identifier prefixes like ]C1, ]Q3, ]d2, etc.
-    Pattern: ']' + 1 letter + 1 digit
-    """
     m = re.match(r"^\][A-Za-z]\d", s)
     return s[m.end():] if m else s
 
@@ -140,9 +173,6 @@ def normalize_lot(lot: Optional[str]) -> str:
     digits = re.sub(r"\D", "", lot)
     return digits.lstrip("0") or "0"
 
-def _is_valid_source_location(loc: str) -> bool:
-    return bool(loc) and loc.isdigit() and len(loc) == 8
-
 # ------------------ LOOKUP SUPPORT ------------------
 def _auto_guess_cols(columns: List[str]) -> Dict[str, Optional[str]]:
     cols_lower = {c.lower(): c for c in columns}
@@ -156,9 +186,9 @@ def _auto_guess_cols(columns: List[str]) -> Dict[str, Optional[str]]:
                 return c
         return None
     return {
-        "pallet": pick(["pallet","pallet id","pallet_id","lpn","license","serial","sscc"]),
-        "sku": pick(["sku","item","itemcode","product","part","material"]),
-        "lot": pick(["lot","lot_number","lot #","lot#","batch","batchno"]),
+        "pallet":   pick(["pallet","pallet id","pallet_id","lpn","license","serial","sscc"]),
+        "sku":      pick(["sku","item","itemcode","product","part","material"]),
+        "lot":      pick(["lot","lot_number","lot #","lot#","batch","batchno"]),
         "location": pick(["location","loc","bin","slot","binlocation","location code","staging","stg"]),
     }
 
@@ -278,7 +308,7 @@ def try_parse_gs1_paren(s: str) -> Optional[Dict[str,str]]:
         elif ai == "10": out["lot"] = val
         elif ai == "01": out["gtin"] = val
         elif ai == "00": out["pallet"] = val
-        elif ai in {"240","241"}: out["pallet"] = val  # NEW: map 240/241 to pallet
+        elif ai in {"240","241"}: out["pallet"] = val
     return out or None
 
 def try_parse_gs1_fnc1(s: str) -> Optional[Dict[str,str]]:
@@ -286,7 +316,7 @@ def try_parse_gs1_fnc1(s: str) -> Optional[Dict[str,str]]:
     if GS not in s and not re.match(r"^\d{2,4}", s):
         return None
     AI_FIXED = {"00":18, "01":14}
-    AI_VAR = {"10","21","240","241"}  # lot, serial/LPN, addl IDs
+    AI_VAR = {"10","21","240","241"}
     i = 0
     n = len(s)
     out: Dict[str,str] = {}
@@ -322,36 +352,29 @@ def try_parse_gs1_fnc1(s: str) -> Optional[Dict[str,str]]:
     return out or None
 
 def try_parse_gs1_numeric_naked(s: str) -> Optional[Dict[str,str]]:
-    """
-    Handles GS1 data that starts directly with AIs but *no* FNC1 and *no* parentheses,
-    e.g., "2408304174125" (single AI 240 with rest of string as value).
-    """
+    # Handles strings like "2408304174125" (single variable-length AI w/o FNC1 or parentheses)
     if not re.match(r"^\d{2,4}", s):
         return None
     out: Dict[str,str] = {}
-    # Only robust when there's effectively a single AI or fixed-length first AI.
-    # Handle common first AIs explicitly:
-    if s.startswith("00") and len(s) >= 20:   # 00 + 18
+    if s.startswith("00") and len(s) >= 20:
         out["pallet"] = s[2:20]
-    elif s.startswith("01") and len(s) >= 16: # 01 + 14
+    elif s.startswith("01") and len(s) >= 16:
         out["gtin"] = s[2:16]
-    elif s.startswith(("21","10","240","241")):
-        # Variable-length: take the remainder
-        val = s[2:] if s.startswith(("21","10")) else s[3:]
-        ai = s[:2] if s.startswith(("21","10")) else s[:3]
-        val = val.strip()
-        if ai in {"21","240","241"} and val:
-            out["pallet"] = val
-        elif ai == "10" and val:
-            out["lot"] = val
+    elif s.startswith(("21","10")):
+        val = s[2:]
+        if s.startswith("21") and val: out["pallet"] = val
+        elif s.startswith("10") and val: out["lot"] = val
+    elif s.startswith(("240","241")):
+        val = s[3:]
+        if val: out["pallet"] = val
     return out or None
 
 def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
     key_map = {
         "location": ["location","loc","bin","slot","staging","stg","binlocation","location code"],
-        "pallet": ["pallet","pallet_id","pallet id","serial","id","license","lpn","sscc"],
-        "sku": ["sku","item","itemcode","product","part","material"],
-        "lot": ["lot","lot_number","lot #","lot#","batch","batchno"],
+        "pallet":   ["pallet","pallet_id","pallet id","serial","id","license","lpn","sscc"],
+        "sku":      ["sku","item","itemcode","product","part","material"],
+        "lot":      ["lot","lot_number","lot #","lot#","batch","batchno"],
     }
     out: Dict[str,str] = {}
     lower_data = {k.lower(): str(v) for k, v in data.items()}
@@ -365,15 +388,13 @@ def normalize_keys(data: Dict[str,str]) -> Dict[str,str]:
     return out
 
 def parse_any_scan(raw_code: str) -> Dict[str,str]:
-    # 1) Strip AIM prefix if present.
     code = strip_aim_prefix(raw_code)
-    # 2) Try multiple strategies.
     for fn in (
         try_parse_json,
         try_parse_query_or_kv,
         try_parse_gs1_paren,
         try_parse_gs1_fnc1,
-        try_parse_gs1_numeric_naked,  # NEW: handle your "240..." case
+        try_parse_gs1_numeric_naked,
         try_parse_label_kv,
         try_parse_label_compact,
     ):
@@ -389,7 +410,8 @@ def parse_any_scan(raw_code: str) -> Dict[str,str]:
 
 # ------------------ SIDEBAR ------------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.4.4 (AIM prefix + GS1 AI 240/241 mapping)", icon="🧭")
+    st.info("BUILD: outbound-batch v1.5 (scan-only UI + Secrets + focus + Scan-to-Add + Undo)", icon="🧭")
+    st.caption(f"Config source: **{CFG['_source']}**")
     st.markdown("### ⚙️ Settings")
     ss["operator"] = st.text_input("Operator (optional)", value=ss.operator, placeholder="e.g., Carlos")
     ss["current_order"] = st.text_input("Order # (optional)", value=ss.current_order, placeholder="e.g., SO-12345")
@@ -398,7 +420,7 @@ with st.sidebar:
     if WEBHOOK_URL:
         st.caption("Submit will POST to configured Power Automate webhook.")
     else:
-        st.warning("PICKING_HELPER_WEBHOOK_URL is not set. Submit will only write CSV locally.")
+        st.warning("Webhook URL is not set. Submit will only write CSV locally.")
 
     st.markdown("---")
     st.markdown("#### Inventory Lookup (optional)")
@@ -421,14 +443,20 @@ with st.sidebar:
         g = guessed or {"pallet": None, "sku": None, "lot": None, "location": None}
         c1, c2 = st.columns(2)
         with c1:
-            ss.lookup_cols["pallet"] = st.selectbox("Pallet column", options=cols, index=cols.index(g["pallet"]) if g["pallet"] in cols else 0)
-            ss.lookup_cols["sku"]   = st.selectbox("SKU column", options=["(none)"] + cols, index=(cols.index(g["sku"]) + 1) if g["sku"] in cols else 0)
+            ss.lookup_cols["pallet"]   = st.selectbox("Pallet column", options=cols, index=cols.index(g["pallet"]) if g["pallet"] in cols else 0)
+            ss.lookup_cols["sku"]      = st.selectbox("SKU column", options=["(none)"] + cols, index=(cols.index(g["sku"]) + 1) if g["sku"] in cols else 0)
         with c2:
             ss.lookup_cols["lot"]      = st.selectbox("LOT column", options=["(none)"] + cols, index=(cols.index(g["lot"]) + 1) if g["lot"] in cols else 0)
             ss.lookup_cols["location"] = st.selectbox("Location column", options=["(none)"] + cols, index=(cols.index(g["location"]) + 1) if g["location"] in cols else 0)
         for k in ["sku","lot","location"]:
             if ss.lookup_cols.get(k) == "(none)":
                 ss.lookup_cols[k] = None
+
+    st.markdown("---")
+    st.markdown("#### Behavior")
+    CFG["require_location"] = st.toggle("Require Location on Add", value=CFG["require_location"], help="If enabled, a batch line cannot be added unless Source Location is known from lookup/scan.")
+    CFG["require_staging"]  = st.toggle("Require Staging on Add", value=CFG["require_staging"], help="If enabled, staging must be scanned/typed before Add to Batch.")
+    CFG["scan_to_add"]      = st.toggle("Scan-to-Add (after QTY, staging scan auto-adds)", value=CFG["scan_to_add"])
 
     st.markdown("---")
     st.markdown("#### Start/Balance (optional)")
@@ -446,60 +474,81 @@ with st.sidebar:
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "streamlit": st.__version__,
-            "LOOKUP_FILE_ENV": LOOKUP_FILE_ENV or "(empty)",
+            "LOOKUP_FILE": LOOKUP_FILE_ENV or "(empty)",
+            "cfg_source": CFG["_source"],
             "cwd": os.getcwd(),
             "files_in_cwd": sorted(os.listdir("."))[:50],
         })
 
+# Kiosk CSS
 if KIOSK:
     st.markdown("<style>#MainMenu, footer {visibility:hidden;}</style>", unsafe_allow_html=True)
 
 # ------------------ HEADER ------------------
 st.title("📦 Picking Helper — Outbound (Batch)")
-st.caption("Scan or type Pallet / Location / LOT → set QTY staged (max 15) → scan/type Staging → Add to batch → Review & Submit")
+st.caption("Scan Pallet → QTY staged (max 15) → (optional) Staging → Add to Batch → Review & Submit")
 
-st.markdown("""
-<script>
- const focusScan = () => {
-   const inputs = window.parent.document.querySelectorAll('input[type="text"]');
-   if (inputs && inputs.length) { inputs[0].focus(); inputs[0].select(); }
- };
- setTimeout(focusScan, 200);
-</script>
-""", unsafe_allow_html=True)
+# Focus helper scripts
+def _focus_first_text():
+    st.markdown("""
+    <script>
+     const f = () => {
+       const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+       if (inputs && inputs.length) { inputs[0].focus(); inputs[0].select(); }
+     };
+     setTimeout(f, 200);
+    </script>
+    """, unsafe_allow_html=True)
+
+def _focus_qty_input():
+    # Target the number input by its label text (aria-label generated from label)
+    st.markdown("""
+    <script>
+     const f = () => {
+       const el = Array.from(window.parent.document.querySelectorAll('input[type="number"]'))
+         .find(i => i.getAttribute('aria-label') && i.getAttribute('aria-label').toLowerCase().includes('enter qty staged'));
+       if (el) { el.focus(); el.select(); }
+     };
+     setTimeout(f, 150);
+    </script>
+    """, unsafe_allow_html=True)
+
+# Initially focus first text input (the pallet scan)
+_focus_first_text()
 
 # ------------------ SCAN/TYPING HANDLERS ------------------
+def _apply_lookup_into_state(pallet_id: str):
+    if ss.lookup_df is None:
+        return
+    lookup_map = {
+        "pallet": ss.lookup_cols.get("pallet"),
+        "sku": ss.lookup_cols.get("sku"),
+        "lot": ss.lookup_cols.get("lot"),
+        "location": ss.lookup_cols.get("location"),
+    }
+    looked = lookup_fields_by_pallet(ss.lookup_df, lookup_map, pallet_id)
+    if looked.get("location"): ss.current_location = looked["location"]
+    if looked.get("sku") is not None: ss.sku = looked.get("sku") or ""
+    if looked.get("lot") is not None: ss.lot_number = looked.get("lot") or ""
+
 def on_pallet_scan():
     raw = ss.scan or ""
     code = clean_scan(raw)
     if not code:
         return
-    ss.last_raw_scan = raw  # keep true raw for debugger
+    ss.last_raw_scan = raw
 
     norm = parse_any_scan(code)
 
     pallet_id = norm.get("pallet") or strip_aim_prefix(code) or code
     ss.current_pallet = pallet_id
 
-    loc = norm.get("location")
-    sku = norm.get("sku")
-    lot = norm.get("lot")
-
-    if ss.lookup_df is not None and (not loc or not sku or not lot):
-        lookup_map = {
-            "pallet": ss.lookup_cols.get("pallet"),
-            "sku": ss.lookup_cols.get("sku"),
-            "lot": ss.lookup_cols.get("lot"),
-            "location": ss.lookup_cols.get("location"),
-        }
-        looked = lookup_fields_by_pallet(ss.lookup_df, lookup_map, pallet_id)
-        loc = loc or looked.get("location")
-        sku = sku or looked.get("sku")
-        lot = lot or looked.get("lot")
-
-    if loc: ss.current_location = loc
-    if sku is not None: ss.sku = sku or ""
-    if lot is not None: ss.lot_number = lot or ""
+    # If scan provided location/lot/sku, use them; otherwise try lookup
+    if norm.get("location"): ss.current_location = norm["location"]
+    if norm.get("sku") is not None: ss.sku = norm.get("sku") or ""
+    if norm.get("lot") is not None: ss.lot_number = norm.get("lot") or ""
+    if not (norm.get("location") and norm.get("lot") and norm.get("sku")):
+        _apply_lookup_into_state(pallet_id)
 
     bits = [f"Pallet {ss.current_pallet}"]
     if ss.current_location: bits.append(f"Location {ss.current_location}")
@@ -511,67 +560,33 @@ def on_pallet_scan():
     ss.recent_scans = ss.recent_scans[:25]
     ss.scan = ""
 
-def on_source_scan():
-    raw = ss.source_scan or ""
-    code = clean_scan(raw)
-    if not code: return
-    ss.current_location = code
-    st.toast(f"Source Location set: {code}", icon="📍")
-    ss.source_scan = ""
+    # Next step should be QTY staged
+    ss.focus_qty = True
 
 def on_staging_scan():
     raw = ss.staging_scan or ""
     code = clean_scan(raw)
-    if not code: return
+    if not code:
+        return
     ss.staging_location_current = code
     st.toast(f"Staging Location set: {code}", icon="📍")
     ss.staging_scan = ""
 
-def on_lot_scan():
-    raw = ss.lot_scan or ""
-    code = clean_scan(raw)
-    if not code: return
-    ss.lot_number = normalize_lot(code)
-    st.toast(f"LOT set: {ss.lot_number}", icon="🧾")
-    ss.lot_scan = ""
+    # If Scan-to-Add is enabled and we have enough context, auto-add
+    if CFG["scan_to_add"] and ss.current_pallet and ss.qty_staged > 0:
+        _add_current_line_to_batch()
 
-def set_typed_source():
-    val = clean_scan(ss.typed_source)
-    ss.current_location = val
-    st.toast(f"Source Location set: {val}", icon="✍️")
-
-def set_typed_pallet():
-    val = clean_scan(ss.typed_pallet_id)
-    if not val: return
-    ss.current_pallet = val
-    if ss.lookup_df is not None:
-        lookup_map = {
-            "pallet": ss.lookup_cols.get("pallet"),
-            "sku": ss.lookup_cols.get("sku"),
-            "lot": ss.lookup_cols.get("lot"),
-            "location": ss.lookup_cols.get("location"),
-        }
-        looked = lookup_fields_by_pallet(ss.lookup_df, lookup_map, val)
-        if looked.get("location"): ss.current_location = looked["location"]
-        if looked.get("sku") is not None: ss.sku = looked.get("sku") or ""
-        if looked.get("lot") is not None: ss.lot_number = looked.get("lot") or ""
-    st.toast(f"Pallet set: {val}", icon="📦")
-
-def set_typed_lot():
-    val = normalize_lot(ss.typed_lot)
-    ss.lot_number = val
-    st.toast(f"LOT set: {val}", icon="✍️")
+def set_typed_staging():
+    val = clean_scan(ss.typed_staging)
+    ss.staging_location_current = val
+    st.toast(f"Staging Location set: {val}", icon="✍️")
 
 # ------------------ MAIN UI ------------------
+# A) Pallet — scan only (typing pallet remains optional in sidebar? we keep scan only for simplicity)
 st.subheader("Pallet ID")
-cP1, cP2 = st.columns([2, 1])
-with cP1:
-    st.text_input("Scan pallet here", key="scan",
-        placeholder="Scan pallet barcode (GS1/AIM/JSON/query/label parsed)",
-        on_change=on_pallet_scan)
-with cP2:
-    st.text_input("…or type Pallet ID", key="typed_pallet_id", placeholder="e.g., JTL00496")
-    st.button("Set Pallet", on_click=set_typed_pallet, use_container_width=True)
+st.text_input("Scan pallet here", key="scan",
+    placeholder="Scan pallet barcode (GS1/AIM/JSON/query/label parsed)",
+    on_change=on_pallet_scan)
 
 with st.expander("🔍 Raw Scan Debugger (last pallet scan)", expanded=False):
     if ss.last_raw_scan:
@@ -589,32 +604,7 @@ with st.expander("🔍 Raw Scan Debugger (last pallet scan)", expanded=False):
     else:
         st.caption("No raw pallet scan captured yet.")
 
-st.subheader("Source Location")
-cL1, cL2 = st.columns([2, 1])
-with cL1:
-    st.text_input("Scan source location here", key="source_scan",
-        placeholder="Scan location barcode (e.g., 11400804)",
-        on_change=on_source_scan)
-with cL2:
-    st.text_input("…or type location", key="typed_source", placeholder="e.g., 11400804")
-    st.button("Set Location", on_click=set_typed_source, use_container_width=True)
-
-if ss.current_location:
-    if not _is_valid_source_location(ss.current_location):
-        st.warning("Expected 8 digits (e.g., 11400804). You can proceed, but please double‑check.", icon="⚠️")
-    else:
-        st.caption("✅ Source Location format looks good.")
-
-st.subheader("LOT Number")
-cLot1, cLot2 = st.columns([2, 1])
-with cLot1:
-    st.text_input("Scan LOT here", key="lot_scan",
-        placeholder="Scan LOT barcode (digits preferred)",
-        on_change=on_lot_scan)
-with cLot2:
-    st.text_input("…or type LOT", key="typed_lot", placeholder="e.g., 9062716")
-    st.button("Set LOT", on_click=set_typed_lot, use_container_width=True)
-
+# B) Staging Location — scan or type
 st.subheader("Staging Location")
 cS1, cS2 = st.columns([2, 1])
 with cS1:
@@ -622,38 +612,56 @@ with cS1:
         placeholder="Scan staging barcode (e.g., STAGE-01)",
         on_change=on_staging_scan)
 with cS2:
-    st.text_input("…or type staging", key="staging_location_current", placeholder="e.g., STAGE-01")
+    st.text_input("…or type staging", key="typed_staging", placeholder="e.g., STAGE-01")
+    st.button("Set Staging", on_click=set_typed_staging, use_container_width=True)
 
+# Current context metrics (read-only)
 st.markdown("---")
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4 = st.columns(4)
 with c1: st.metric("Order # (optional)", ss.current_order or "—")
-with c2: st.metric("Source Location", ss.current_location or "—")
-with c3: st.metric("Pallet ID", ss.current_pallet or "—")
-with c4: st.metric("SKU", ss.sku or "—")
-with c5: st.metric("LOT Number", ss.lot_number or "—")
+with c2: st.metric("Pallet ID", ss.current_pallet or "—")
+with c3: st.metric("SKU", ss.sku or "—")
+with c4: st.metric("LOT Number", ss.lot_number or "—")
+c5, c6 = st.columns(2)
+with c5: st.metric("Source Location", ss.current_location or "—")
 with c6:
     rem = get_remaining(ss.starting_qty if ss.starting_qty != 0 else None, ss.current_pallet) if ss.current_pallet else None
     st.metric("Remaining (est.)", "—" if rem is None else rem)
+
 with st.expander("Recent scans", expanded=False):
     if ss.recent_scans:
         for t, c in ss.recent_scans[:10]:
             st.write(f"🕒 {t} — **{c}**")
     else:
         st.info("No scans yet.")
+
 st.markdown("---")
 
+# QTY staged — numeric only
 st.subheader("QTY staged (1–15)")
-qty_staged = st.number_input("Enter QTY staged", min_value=0, max_value=15, step=1, value=ss.qty_staged or 0)
+qty_staged = st.number_input(
+    "Enter QTY staged",
+    min_value=0, max_value=15, step=1, value=ss.qty_staged or 0,
+    help="Type the quantity staged for this line (max 15)."
+)
 ss.qty_staged = qty_staged
+if ss.focus_qty:
+    _focus_qty_input()
+    ss.focus_qty = False
 
+# Optional running tracker
 st.subheader("Pick (optional tracker)")
 pick_qty = st.number_input("Qty picked", min_value=0, step=1, value=0)
-colA, colB, colC, colD = st.columns([1,1,1,1])
+
+# Batch controls
+colA, colB, colC, colD, colE = st.columns([1,1,1,1,1])
 with colA:
-    add_to_batch = st.button("➕ Add to Batch", use_container_width=True)
+    add_to_batch_click = st.button("➕ Add to Batch", use_container_width=True)
 with colB:
     do_tag = st.button("🏷️ Generate Partial Pallet Tag", use_container_width=True)
 with colC:
+    undo_last = st.button("↩ Undo Last Line", use_container_width=True, disabled=not ss.batch_rows and not ss.undo_stack)
+with colD:
     st.download_button(
         "⬇️ Download Today’s CSV Log",
         data=open(LOG_FILE, "rb").read() if os.path.exists(LOG_FILE) else b"",
@@ -662,39 +670,55 @@ with colC:
         disabled=not os.path.exists(LOG_FILE),
         use_container_width=True
     )
-with colD:
+with colE:
     clear_batch = st.button("🗑️ Clear Batch", use_container_width=True, disabled=not ss.batch_rows)
 
-if add_to_batch:
+def _add_current_line_to_batch():
+    # Validation derived from settings
     if not ss.current_pallet:
-        st.error("Set a **Pallet ID** (scan or type) before adding.")
-    elif not ss.current_location:
-        st.error("Set a **Source Location** (scan or type) before adding.")
-    elif ss.qty_staged <= 0:
+        st.error("Scan a **Pallet ID** before adding.")
+        return False
+    if CFG["require_location"] and not ss.current_location:
+        st.error("No **Source Location** found for this pallet (lookup/scan).")
+        return False
+    if CFG["require_staging"] and not ss.staging_location_current:
+        st.error("Scan/Type a **Staging Location** before adding.")
+        return False
+    if ss.qty_staged <= 0:
         st.error("Enter a **QTY staged** > 0.")
-    else:
-        if pick_qty > 0:
-            upsert_picked(ss.current_pallet, int(pick_qty))
-        line = {
-            "order_number": ss.current_order or "",
-            "source_location": ss.current_location,
-            "staging_location": ss.staging_location_current or "",
-            "pallet_id": ss.current_pallet,
-            "sku": ss.sku or "",
-            "lot_number": ss.lot_number or "",
-            "qty_staged": int(ss.qty_staged),
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        ss.batch_rows.append(line)
-        st.success(
-            f"Added: Pallet {line['pallet_id']} — QTY {line['qty_staged']}"
-            + (f" → {line['staging_location']}" if line['staging_location'] else "")
-        )
-        ss.qty_staged = 0
+        return False
 
+    if pick_qty > 0:
+        upsert_picked(ss.current_pallet, int(pick_qty))
+
+    line = {
+        "order_number": ss.current_order or "",
+        "source_location": ss.current_location or "",
+        "staging_location": ss.staging_location_current or "",
+        "pallet_id": ss.current_pallet,
+        "sku": ss.sku or "",
+        "lot_number": ss.lot_number or "",
+        "qty_staged": int(ss.qty_staged),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    ss.batch_rows.append(line)
+    ss.undo_stack.append(("add", line))  # track for undo
+    st.success(
+        f"Added: Pallet {line['pallet_id']} — QTY {line['qty_staged']}"
+        + (f" → {line['staging_location']}" if line['staging_location'] else "")
+    )
+    # reset qty only
+    ss.qty_staged = 0
+    return True
+
+# Handle Add to Batch click
+if add_to_batch_click:
+    _add_current_line_to_batch()
+
+# Tag generation
 if do_tag:
     if not ss.current_pallet:
-        st.error("Set a **Pallet ID** before generating a tag.")
+        st.error("Scan a **Pallet ID** before generating a tag.")
     else:
         remaining = get_remaining(ss.starting_qty if ss.starting_qty != 0 else None, ss.current_pallet)
         ss.tag_bytes = make_partial_tag_png(
@@ -703,16 +727,37 @@ if do_tag:
             qty_remaining=remaining,
             operator=ss.operator or ""
         )
+
 if ss.tag_bytes:
     st.subheader("Partial Pallet Tag")
     st.image(ss.tag_bytes, caption="Preview", use_column_width=True)
-    st.download_button("⬇️ Download Tag (PNG)", data=ss.tag_bytes,
-                       file_name=f"partial-tag-{ss.current_pallet or 'pallet'}.png", mime="image/png")
+    st.download_button(
+        "⬇️ Download Tag (PNG)",
+        data=ss.tag_bytes,
+        file_name=f"partial-tag-{ss.current_pallet or 'pallet'}.png",
+        mime="image/png"
+    )
 
+# Undo last line
+if undo_last:
+    if ss.batch_rows:
+        last = ss.batch_rows.pop()
+        ss.undo_stack.append(("remove", last))
+        st.warning(f"Removed last line for pallet {last.get('pallet_id','?')}. Click again to undo removal.", icon="↩")
+    elif ss.undo_stack:
+        # If last action was a removal, restore it
+        act, row = ss.undo_stack.pop()
+        if act == "remove":
+            ss.batch_rows.append(row)
+            st.success(f"Restored line for pallet {row.get('pallet_id','?')}.")
+
+# Clear batch
 if clear_batch and ss.batch_rows:
+    ss.undo_stack.append(("remove_all", ss.batch_rows.copy()))
     ss.batch_rows = []
     st.warning("Batch cleared.")
 
+# ------------------ REVIEW & SUBMIT ------------------
 st.markdown("---")
 st.subheader("Review & Submit")
 if not ss.batch_rows:
@@ -760,7 +805,8 @@ else:
             new_rows = []
             for _, r in edited.iterrows():
                 qty = int(r.get("qty_staged", 0) or 0)
-                if qty <= 0: continue
+                if qty <= 0:
+                    continue
                 if qty > 15:
                     st.error(f"Line for pallet {r.get('pallet_id','?')}: qty {qty} > 15 (max). Using 15.")
                     qty = 15
@@ -783,13 +829,15 @@ else:
             else:
                 bad = []
                 for r in ss.batch_rows:
-                    if not r.get("pallet_id") or not r.get("source_location"):
+                    if (CFG["require_location"] and not r.get("source_location")) or not r.get("pallet_id"):
+                        bad.append(r)
+                    if CFG["require_staging"] and not r.get("staging_location"):
                         bad.append(r)
                     q = int(r.get("qty_staged", 0))
                     if q <= 0 or q > 15:
                         bad.append(r)
                 if bad:
-                    st.error("Some lines are invalid (missing pallet/location or qty not in 1–15). Fix and try again.")
+                    st.error("Some lines are invalid (missing required fields or qty not in 1–15). Fix and try again.")
                 else:
                     batch_id = f"BATCH-{datetime.now().isoformat(timespec='seconds')}-{(ss.operator or 'operator')}".replace(":", "")
                     submitted_at = datetime.now().isoformat(timespec="seconds")
@@ -802,6 +850,7 @@ else:
                         "totals": {"lines": len(ss.batch_rows), "qty_staged_sum": totals_qty},
                         "notify_to": NOTIFY_TO,
                     }
+                    # Webhook
                     sent_ok = False
                     send_error = None
                     if WEBHOOK_URL:
@@ -812,6 +861,7 @@ else:
                             sent_ok = True
                         except Exception as e:
                             send_error = str(e)
+                    # Log locally
                     for r in ss.batch_rows:
                         qty_picked = ""
                         remaining_after = ""
@@ -834,6 +884,7 @@ else:
                             "batch_id": batch_id,
                             "action": "SUBMIT",
                         })
+                    # Save JSON backup
                     try:
                         with open(os.path.join(LOG_DIR, f"{batch_id}.json"), "w", encoding="utf-8") as jf:
                             json.dump(payload, jf, ensure_ascii=False, indent=2)
@@ -844,10 +895,14 @@ else:
                     else:
                         st.success("Submitted! Admin will receive the email/Teams notification.")
                     ss.batch_rows = []
-                    st.toast(f"Batch {batch_id} submitted — {payload['totals']['lines']} lines / {payload['totals']['qty_staged_sum']} cases.", icon="📨")
+                    st.toast(
+                        f"Batch {batch_id} submitted — {payload['totals']['lines']} lines / {payload['totals']['qty_staged_sum']} cases.",
+                        icon="📨"
+                    )
                     time.sleep(0.5)
                     st.rerun()
 
+# ------------------ Today’s Log Preview ------------------
 st.markdown("---")
 st.subheader("Today’s Log (preview)")
 if os.path.exists(LOG_FILE):
