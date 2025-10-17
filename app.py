@@ -1,5 +1,5 @@
 # app.py — Outbound Picking Helper (Batch Submit)
-# v1.6.3 — Fix session_state crash when clearing QTY; keep LOT->CustomerLotReference & QTY->QTYOnHand; AIM prefix fix.
+# v1.6.4 — Auto-clear top fields after Add; toggle to keep/clear staging; keep prior fixes (AIM, LOT/QTY defaults, safe clear)
 
 import os
 import io
@@ -35,6 +35,8 @@ def _get_cfg():
         "require_location": str(get("require_location", "PICKING_HELPER_REQUIRE_LOCATION", "1")).strip().lower() in ("1","true","yes"),
         "require_staging": str(get("require_staging", "PICKING_HELPER_REQUIRE_STAGING", "0")).strip().lower() in ("1","true","yes"),
         "scan_to_add": str(get("scan_to_add", "PICKING_HELPER_SCAN_TO_ADD", "1")).strip().lower() in ("1","true","yes"),
+        # new behavior toggle (defaults)
+        "keep_staging_after_add": str(get("keep_staging_after_add", "PICKING_HELPER_KEEP_STAGING_AFTER_ADD", "1")).strip().lower() in ("1","true","yes"),
     }
     nt = cfg["notify_to"]
     if isinstance(nt, list):
@@ -90,7 +92,8 @@ defaults = {
     "redo_stack": [],
     "start_qty_by_pallet": {},     # pallet_id -> int
     "pallet_qty": None,            # KPI value for current pallet
-    "clear_qty_next": False,       # NEW: safely clear QTY on the next run
+    "clear_qty_next": False,       # safe clear for QTY input
+    "clear_top_next": False,       # NEW: safe clear top pallet/fields before UI draw
 }
 for k, v in defaults.items():
     if k not in ss:
@@ -405,7 +408,7 @@ def parse_any_scan(raw_code: str) -> Dict[str,str]:
 
 # -------------------- SIDEBAR --------------------
 with st.sidebar:
-    st.info("BUILD: outbound-batch v1.6.3 (AIM fix • LOT=CustomerLotReference • QTY=QTYOnHand • safe clear)", icon="🧭")
+    st.info("BUILD: outbound-batch v1.6.4 (auto-clear after Add • staging toggle • AIM/LOT/QTY fixes)", icon="🧭")
     st.caption(f"Config source: **{CFG['_source']}**")
 
     st.markdown("### ⚙️ Settings")
@@ -434,7 +437,6 @@ with st.sidebar:
             st.rerun()
     with cols_btn[1]:
         pass
-
     up_bytes = uploaded.read() if uploaded is not None else None
     df, guessed = None, None
     lookup_error = None
@@ -450,7 +452,6 @@ with st.sidebar:
         st.success(f"Loaded lookup with {len(ss.lookup_df):,} rows")
         cols = list(ss.lookup_df.columns)
 
-        # Preferred defaults — exact matches if present
         desired_defaults = {
             "pallet": "PalletID",
             "lot": "CustomerLotReference",
@@ -463,7 +464,6 @@ with st.sidebar:
             if want and want in cols:
                 g[key] = want
 
-        # QTY preferred candidates — prioritize QTYOnHand
         qty_candidates = ["QTYOnHand", "QTY On Hand", "OnHandQty", "On Hand", "On_Hand"]
         for qn in qty_candidates:
             if qn in cols:
@@ -489,6 +489,8 @@ with st.sidebar:
     CFG["require_location"] = st.toggle("Require Location on Add", value=CFG["require_location"])
     CFG["require_staging"]  = st.toggle("Require Staging on Add",  value=CFG["require_staging"])
     CFG["scan_to_add"]      = st.toggle("Scan-to-Add (after QTY, staging scan auto-adds)", value=CFG["scan_to_add"])
+    # NEW: toggle for staging persistence
+    CFG["keep_staging_after_add"] = st.toggle("Keep Staging Location after Add", value=CFG["keep_staging_after_add"])
     st.markdown("---")
     st.markdown("#### Start/Balance (optional)")
     ss["starting_qty"] = st.number_input(
@@ -540,6 +542,25 @@ def _focus_qty_input():
     </script>
     """, unsafe_allow_html=True)
 
+# -------------------- SAFE PRE-CLEAR BEFORE UI --------------------
+# If the previous run requested a top-field clear, do it before rendering inputs.
+if ss.clear_top_next:
+    ss.clear_top_next = False
+    ss.current_pallet = ""
+    ss.sku = ""
+    ss.lot_number = ""
+    ss.current_location = ""
+    ss.pallet_qty = None
+    ss.scan = ""  # pallet scan box
+    if not CFG["keep_staging_after_add"]:
+        ss.staging_location_current = ""
+    # qty is cleared via ss.clear_qty_next flag below
+
+# If quantity should be cleared, clear it BEFORE the widget is created.
+if ss.clear_qty_next:
+    ss.clear_qty_next = False
+    st.session_state["qty_picked_str"] = ""
+
 _focus_first_text()
 
 # -------------------- Pallet + Staging --------------------
@@ -567,6 +588,7 @@ def _apply_lookup_into_state(pallet_id: str):
     elif ss.starting_qty and pallet_id:
         ss.pallet_qty = clamp_nonneg(safe_int(ss.starting_qty, 0))
         ss.start_qty_by_pallet[pallet_id] = ss.pallet_qty
+
 def on_pallet_scan():
     raw = ss.scan or ""
     code = clean_scan(raw)
@@ -661,12 +683,6 @@ with st.expander("Recent scans", expanded=False):
 st.markdown("---")
 
 # -------------------- QTY Picked + Batch controls --------------------
-# Safely clear the input BEFORE creating the widget (if flagged)
-if ss.clear_qty_next:
-    ss.clear_qty_next = False
-    # Clear underlying widget state on a fresh run
-    st.session_state["qty_picked_str"] = ""
-
 st.subheader("QTY Picked (1–15)")
 qty_str = st.text_input(
     "Enter QTY Picked",
@@ -734,8 +750,9 @@ def _add_current_line_to_batch():
         f"Added: Pallet {line['pallet_id']} — QTY {line['qty_staged']}"
         + (f" → {line['staging_location']}" if line['staging_location'] else "")
     )
-    # Safe clear: flag and rerun; the field is cleared before widget creation
-    ss.clear_qty_next = True
+    # Request safe clears on the next run
+    ss.clear_qty_next = True     # clears QTY Picked widget
+    ss.clear_top_next = True     # clears top pallet fields (and staging if toggle is off)
     ss.qty_staged = 0
     st.rerun()
     return True
